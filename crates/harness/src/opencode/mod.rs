@@ -1388,6 +1388,11 @@ async fn run_session(session: Session) {
                 })
         })
         .collect();
+    // The run's own window. The 2.x usage frame names no provider/model, so
+    // this is the only denominator the context meter can fall back to.
+    let run_window = model
+        .as_ref()
+        .and_then(|(provider, model)| context_windows.get(&format!("{provider}/{model}")).copied());
     drop(providers);
 
     let mut assistant_message_id = new_message_id();
@@ -1786,6 +1791,7 @@ async fn run_session(session: Session) {
                             turn: &mut turn,
                             pending_usage: &mut pending_usage,
                             context_windows: &context_windows,
+                            run_window,
                         }).await;
                         match outcome {
                             BusOutcome::Continue => {}
@@ -1865,7 +1871,32 @@ async fn create_session(server: &Server, dir: Option<&str>) -> Result<String, Ha
     unreachable!("create_session retry loop returns from every path")
 }
 
-fn context_usage_event(info: &Value, context_windows: &HashMap<String, u64>) -> Option<AgentEvent> {
+/// Provider/model carried by a message info. 1.x put them flat on the
+/// assistant message; the 2.x assistant message (`Session.Message.Assistant`)
+/// nests them under `model` (a `Model.Ref` = `{id, providerID, variant}`).
+fn message_model(info: &Value) -> Option<(String, String)> {
+    let flat = info
+        .get("providerID")
+        .and_then(Value::as_str)
+        .zip(info.get("modelID").and_then(Value::as_str));
+    let nested = info
+        .pointer("/model/providerID")
+        .and_then(Value::as_str)
+        .zip(info.pointer("/model/id").and_then(Value::as_str));
+    flat.or(nested)
+        .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
+}
+
+/// `fallback_window` is the window of the model this run requested. The 2.x
+/// usage frame (`session.usage.updated` → a synthetic assistant message)
+/// carries no provider/model at all, so without it the meter would report
+/// tokens and no denominator, and the UI hides the indicator entirely when
+/// the window is unknown.
+fn context_usage_event(
+    info: &Value,
+    context_windows: &HashMap<String, u64>,
+    fallback_window: Option<u64>,
+) -> Option<AgentEvent> {
     let tokens = info.get("tokens")?;
     let counts: Vec<u64> = [
         tokens.get("input"),
@@ -1888,11 +1919,9 @@ fn context_usage_event(info: &Value, context_windows: &HashMap<String, u64>) -> 
     if tokens == Some(0) && info.pointer("/time/completed").is_none() {
         return None;
     }
-    let window = info
-        .get("providerID")
-        .and_then(Value::as_str)
-        .zip(info.get("modelID").and_then(Value::as_str))
-        .and_then(|(provider, model)| context_windows.get(&format!("{provider}/{model}")).copied());
+    let window = message_model(info)
+        .and_then(|(provider, model)| context_windows.get(&format!("{provider}/{model}")).copied())
+        .or(fallback_window);
     (tokens.is_some() || window.is_some()).then_some(AgentEvent::ContextUsage { tokens, window })
 }
 
@@ -2145,6 +2174,9 @@ struct BusCtx<'a> {
     turn: &'a mut TurnState,
     pending_usage: &'a mut Option<AgentEvent>,
     context_windows: &'a HashMap<String, u64>,
+    /// The requested model's context window, used when an event carries no
+    /// provider/model of its own (2.x `session.usage.updated`).
+    run_window: Option<u64>,
 }
 
 /// Wrap an event as subagent-attributed traffic.
@@ -2198,6 +2230,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         turn,
         pending_usage,
         context_windows,
+        run_window,
     } = ctx;
     // Envelope styles: /global/event wraps ({payload: {...}}); a bare
     // /event feed (tests) delivers the payload directly.
@@ -2367,7 +2400,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 if role == "assistant"
                     && let Some(tokens) = info.get("tokens")
                 {
-                    if let Some(usage) = context_usage_event(info, context_windows)
+                    if let Some(usage) = context_usage_event(info, context_windows, run_window)
                         && !send(event_tx, usage).await
                     {
                         return BusOutcome::ConsumerGone;
@@ -4099,24 +4132,73 @@ mod context_tests {
             "input": 200, "output": 100, "reasoning": 50, "cache": {"read":40000,"write":1800}
         }});
         assert_eq!(
-            context_usage_event(&info, &windows),
+            context_usage_event(&info, &windows, None),
             Some(AgentEvent::ContextUsage {
                 tokens: Some(42100),
                 window: Some(200000)
             })
         );
         assert_eq!(
-            context_usage_event(&json!({"tokens":{"input":0,"output":0}}), &windows),
+            context_usage_event(&json!({"tokens":{"input":0,"output":0}}), &windows, None),
             None
         );
         assert_eq!(
             context_usage_event(
                 &json!({"time":{"completed":1},"tokens":{"input":0,"output":0}}),
-                &windows
+                &windows,
+                None
             ),
             Some(AgentEvent::ContextUsage {
                 tokens: Some(0),
                 window: None
+            })
+        );
+    }
+
+    #[test]
+    fn context_window_resolves_from_the_2x_nested_model_ref() {
+        // `Session.Message.Assistant` carries `model: Model.Ref`, not flat
+        // providerID/modelID.
+        let windows = HashMap::from([("provider/model".into(), 200000)]);
+        let info = json!({
+            "model": {"id": "model", "providerID": "provider"},
+            "tokens": {"input": 10, "output": 5, "cache": {"read": 0, "write": 0}}
+        });
+        assert_eq!(
+            context_usage_event(&info, &windows, None),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(15),
+                window: Some(200000)
+            })
+        );
+    }
+
+    #[test]
+    fn usage_frame_without_a_model_falls_back_to_the_run_window() {
+        // `session.usage.updated` normalizes to a synthetic assistant message
+        // that names no provider/model, so the requested model is the only
+        // denominator left. Without it the UI hides the indicator outright.
+        let windows = HashMap::from([("provider/model".into(), 200000)]);
+        let info =
+            json!({"id": "usage", "role": "assistant", "tokens": {"input": 200, "output": 100}});
+        assert_eq!(
+            context_usage_event(&info, &windows, Some(200000)),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(300),
+                window: Some(200000)
+            })
+        );
+    }
+
+    #[test]
+    fn a_frame_model_missing_from_the_catalog_still_uses_the_run_window() {
+        let windows = HashMap::from([("provider/model".into(), 200000)]);
+        let info = json!({"providerID": "other", "modelID": "unknown", "tokens": {"input": 1}});
+        assert_eq!(
+            context_usage_event(&info, &windows, Some(200000)),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(1),
+                window: Some(200000)
             })
         );
     }
