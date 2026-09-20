@@ -47,6 +47,8 @@ pub enum ShortcutsEvent {
     KeymapChanged(KeymapConfig),
     /// The Escape fallback changed — persist it locally.
     EscapeStopsActiveAgentChanged(bool),
+    /// The session-cycling order changed — persist it locally.
+    CycleSessionsRecentlyUsedChanged(bool),
     /// The composer send behavior changed — persist + re-apply.
     ComposerSendBehaviorChanged(ComposerSendBehavior),
     AppshotsChanged {
@@ -63,6 +65,7 @@ pub struct ShortcutsPage {
     /// Working copy (kept in sync with the shell via change events).
     keymap: KeymapConfig,
     escape_stops_active_agent: bool,
+    cycle_sessions_recently_used: bool,
     composer_send_behavior: ComposerSendBehavior,
     recording: Option<ShortcutId>,
     recording_blur: Option<gpui::Subscription>,
@@ -89,6 +92,7 @@ impl ShortcutsPage {
         state: Entity<AppState>,
         keymap: KeymapConfig,
         escape_stops_active_agent: bool,
+        cycle_sessions_recently_used: bool,
         composer_send_behavior: ComposerSendBehavior,
         appshots_enabled: bool,
         appshot_sound_enabled: bool,
@@ -103,6 +107,7 @@ impl ShortcutsPage {
             scroll: crate::settings::widgets::PageScroll::default(),
             keymap,
             escape_stops_active_agent,
+            cycle_sessions_recently_used,
             composer_send_behavior,
             recording: None,
             recording_blur: None,
@@ -169,6 +174,14 @@ impl ShortcutsPage {
         if self.escape_stops_active_agent != enabled {
             self.escape_stops_active_agent = enabled;
             cx.emit(ShortcutsEvent::EscapeStopsActiveAgentChanged(enabled));
+            cx.notify();
+        }
+    }
+
+    fn set_cycle_sessions_recently_used(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.cycle_sessions_recently_used != enabled {
+            self.cycle_sessions_recently_used = enabled;
+            cx.emit(ShortcutsEvent::CycleSessionsRecentlyUsedChanged(enabled));
             cx.notify();
         }
     }
@@ -531,9 +544,11 @@ impl Render for ShortcutsPage {
         let theme = Theme::of(cx).clone();
         let recording = self.recording;
         let escape_stops_active_agent = self.escape_stops_active_agent;
+        let cycle_sessions_recently_used = self.cycle_sessions_recently_used;
         let send_behavior = self.composer_send_behavior;
         let customized = self.keymap != KeymapConfig::default()
             || escape_stops_active_agent
+            || cycle_sessions_recently_used
             || send_behavior != ComposerSendBehavior::default();
         let modifier_label = modifier_send_label(cfg!(target_os = "macos"));
 
@@ -565,6 +580,41 @@ impl Render for ShortcutsPage {
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_escape_stops_active_agent(!escape_stops_active_agent, cx);
+                        })),
+                ),
+        );
+
+        let cycle_order_row = widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .min_h(px(84.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(widgets::row_title(
+                            &theme,
+                            "Cycle sessions in recently used order",
+                        ))
+                        .child(
+                            div()
+                                .mt(px(4.0))
+                                .max_w(px(430.0))
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .line_height(px(17.0))
+                                .text_color(theme.text_muted.opacity(0.65))
+                                .child(SharedString::from(
+                                    "Ctrl+Tab switches back to the session you opened last, and keeps toggling between those two until you open another. Ctrl+Shift+Tab keeps the sidebar order.",
+                                )),
+                        ),
+                )
+                .child(
+                    widgets::toggle_switch(&theme, cycle_sessions_recently_used)
+                        .id("cycle-sessions-recently-used-toggle")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_cycle_sessions_recently_used(!cycle_sessions_recently_used, cx);
                         })),
                 ),
         );
@@ -775,6 +825,9 @@ impl Render for ShortcutsPage {
                                                         this.set_escape_stops_active_agent(
                                                             false, cx,
                                                         );
+                                                        this.set_cycle_sessions_recently_used(
+                                                            false, cx,
+                                                        );
                                                         this.set_composer_send_behavior(
                                                             ComposerSendBehavior::Enter,
                                                             cx,
@@ -810,7 +863,8 @@ impl Render for ShortcutsPage {
                                     .text_color(theme.text_muted)
                                     .child(helper),
                             )
-                            .child(escape_behavior_row),
+                            .child(escape_behavior_row)
+                            .child(cycle_order_row),
                     ),
             )
             .children(scrollbar)
@@ -833,6 +887,7 @@ mod tests {
             let mut page = ShortcutsPage::new(
                 state,
                 KeymapConfig::default(),
+                false,
                 false,
                 ComposerSendBehavior::default(),
                 false,
@@ -926,6 +981,7 @@ mod tests {
             ShortcutsPage::new(
                 state,
                 KeymapConfig::default(),
+                false,
                 false,
                 ComposerSendBehavior::default(),
                 false,

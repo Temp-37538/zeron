@@ -695,6 +695,11 @@ pub struct AppState {
     /// the local device.
     pub selected_device: Option<String>,
     pub selected_chat: Option<String>,
+    /// The session the current one replaced, held for Ctrl+Tab's recently-used
+    /// toggle (see `Shell::cycle_session`). One slot by design: the setting
+    /// toggles between the two most recent sessions, it does not walk a
+    /// history. Device-local and in-memory.
+    pub last_session: Option<String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
     /// First chats / spaces watch frame has landed — device-local state that
@@ -806,6 +811,7 @@ impl AppState {
             no_project: false,
             selected_device: None,
             selected_chat: None,
+            last_session: None,
             transcript: Vec::new(),
             queue: Vec::new(),
             context_usage: None,
@@ -2095,6 +2101,10 @@ impl AppState {
                 }
             }
         }
+        // Remember what this selection replaced: the single slot behind
+        // Ctrl+Tab's recently-used toggle. Re-selecting the current session
+        // returns early above, so this only ever records a real move.
+        self.last_session = self.selected_chat.clone();
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
         self.transcript.clear();
@@ -3383,6 +3393,32 @@ mod tests {
                 state.transcript[0].id, "full",
                 "revisit must preserve the cache"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn select_chat_remembers_the_session_it_replaced(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AppState::new());
+        state.update(cx, |state, cx| {
+            assert_eq!(state.last_session, None);
+            state.select_chat(Some("a".into()), cx);
+            assert_eq!(
+                state.last_session, None,
+                "the first selection replaces nothing"
+            );
+            state.select_chat(Some("d".into()), cx);
+            assert_eq!(state.last_session.as_deref(), Some("a"));
+            // The slot swaps on every move, which is what keeps Ctrl+Tab
+            // bouncing between exactly two sessions.
+            state.select_chat(Some("a".into()), cx);
+            assert_eq!(state.last_session.as_deref(), Some("d"));
+            // Re-selecting the current session returns early and must not
+            // consume the slot.
+            state.select_chat(Some("a".into()), cx);
+            assert_eq!(state.last_session.as_deref(), Some("d"));
+            // The new-session canvas is a move too: leaving "a" records it.
+            state.select_chat(None, cx);
+            assert_eq!(state.last_session.as_deref(), Some("a"));
         });
     }
 

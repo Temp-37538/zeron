@@ -3995,6 +3995,7 @@ impl Shell {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
                     let escape_stops_active_agent = self.settings.escape_stops_active_agent;
+                    let cycle_sessions_recently_used = self.settings.cycle_sessions_recently_used;
                     let composer_send_behavior = self.settings.composer_send_behavior;
                     let appshots_enabled = self.settings.appshots_enabled;
                     let appshot_sound_enabled = self.settings.appshot_sound_enabled;
@@ -4004,6 +4005,7 @@ impl Shell {
                             state,
                             keymap,
                             escape_stops_active_agent,
+                            cycle_sessions_recently_used,
                             composer_send_behavior,
                             appshots_enabled,
                             appshot_sound_enabled,
@@ -4021,6 +4023,9 @@ impl Shell {
                                 }
                                 ShortcutsEvent::EscapeStopsActiveAgentChanged(enabled) => {
                                     this.settings.escape_stops_active_agent = *enabled;
+                                }
+                                ShortcutsEvent::CycleSessionsRecentlyUsedChanged(enabled) => {
+                                    this.settings.cycle_sessions_recently_used = *enabled;
                                 }
                                 ShortcutsEvent::ComposerSendBehaviorChanged(behavior) => {
                                     this.settings.composer_send_behavior = *behavior;

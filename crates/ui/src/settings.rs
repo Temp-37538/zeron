@@ -696,6 +696,9 @@ pub struct UiSettings {
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
     pub escape_stops_active_agent: bool,
+    /// Whether Ctrl+Tab toggles with the session left last instead of stepping
+    /// through the sidebar in drawn order. Device-local and opt-in.
+    pub cycle_sessions_recently_used: bool,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
     /// Optional columns shown in every Git History pane.
@@ -789,6 +792,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
+            cycle_sessions_recently_used: false,
             composer_send_behavior: ComposerSendBehavior::default(),
             appshots_enabled: false,
             appshot_sound_enabled: true,
@@ -2033,6 +2037,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             escape_stops_active_agent: true,
+            cycle_sessions_recently_used: true,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             appshots_enabled: false,
             appshot_sound_enabled: true,
@@ -2095,6 +2100,7 @@ mod tests {
         assert_eq!(UiSettings::load(dir.path()), settings);
         assert!(json.contains(r#""codeFencesFitContent": true"#));
         assert!(json.contains(r#""openWebLinksInZeron": false"#));
+        assert!(json.contains(r#""cycleSessionsRecentlyUsed": true"#));
         assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
         assert!(json.contains(r#""terminalFontFamily": "installed:Menlo""#));
         assert!(json.contains(r#""terminalFontSize": 15.0"#));
@@ -2264,6 +2270,10 @@ mod tests {
         assert!(
             !loaded.escape_stops_active_agent,
             "preference files default Escape stopping off"
+        );
+        assert!(
+            !loaded.cycle_sessions_recently_used,
+            "preference files default recently-used cycling off"
         );
         assert_eq!(
             loaded.git_history_columns,
@@ -2894,6 +2904,7 @@ mod tests {
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
         assert!(!loaded.escape_stops_active_agent);
+        assert!(!loaded.cycle_sessions_recently_used);
     }
 
     #[test]

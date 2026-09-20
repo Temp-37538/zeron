@@ -31,6 +31,24 @@ pub(super) fn cycle_target(
     Some(order[next].clone())
 }
 
+/// The session Ctrl+Tab lands on when "cycle in recently used order" is on:
+/// the one this selection replaced, provided it is still visible and is not
+/// the current session.
+///
+/// `None` means fall through to the drawn order: nothing selected (the
+/// new-session canvas), a previous session that has since left the visible
+/// list (filtered space, archived elsewhere), or the degenerate case where the
+/// slot holds the current session.
+pub(super) fn recently_used_target(
+    order: &[String],
+    selected: Option<&str>,
+    last: Option<&str>,
+) -> Option<String> {
+    let selected = selected?;
+    let last = last?;
+    (last != selected && order.iter().any(|id| id == last)).then(|| last.to_owned())
+}
+
 pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
     if expanded {
         icons::COLLAPSE_ARROWS
@@ -74,8 +92,12 @@ impl Shell {
     }
 
     /// Ctrl+Tab / Ctrl+Shift+Tab: step through the sidebar's Sessions list in
-    /// the order it is drawn. Selection is immediate (no MRU overlay held open
-    /// on the modifier) — one press, one session.
+    /// the order it is drawn. Selection is immediate (no overlay held open on
+    /// the modifier): one press, one session.
+    ///
+    /// With "cycle sessions in recently used order" on, Ctrl+Tab instead
+    /// toggles with the session this one replaced, as long as that session is
+    /// still visible. Ctrl+Shift+Tab is untouched.
     ///
     /// Chat-scoped chrome, like the panel toggles: gpui dispatches a matched
     /// binding before any `on_key_down`, so an unscoped cycle would fire
@@ -91,6 +113,16 @@ impl Shell {
         // count — one function, so neither can drift from the screen.
         let order = self.sidebar_visible_order(cx);
         let selected = self.state.read(cx).selected_chat.clone();
+        // Recently-used mode replaces Ctrl+Tab only. Ctrl+Shift+Tab keeps the
+        // drawn order, so "back one row" never changes meaning under the user.
+        if forward && self.settings.cycle_sessions_recently_used {
+            let last = self.state.read(cx).last_session.clone();
+            let target = recently_used_target(&order, selected.as_deref(), last.as_deref());
+            if let Some(target) = target {
+                self.open_chat(target, cx);
+                return;
+            }
+        }
         if let Some(target) = cycle_target(&order, selected.as_deref(), forward) {
             self.open_chat(target, cx);
         }
@@ -589,4 +621,41 @@ mod cycle_tests {
     // `AppState::sidebar_chats` the sidebar and the jump shortcuts read, and
     // `jump_slots_count_the_rows_the_sidebar_draws` (state.rs) covers the
     // space-filter behaviour for all of them.
+
+    #[test]
+    fn recently_used_mode_toggles_with_the_session_left_last() {
+        let list = order(&["a", "b", "c"]);
+        assert_eq!(
+            recently_used_target(&list, Some("b"), Some("a")).as_deref(),
+            Some("a")
+        );
+        // After the switch the slot holds the session we just left, so the
+        // next press comes straight back: a two-session toggle, not a walk.
+        assert_eq!(
+            recently_used_target(&list, Some("a"), Some("b")).as_deref(),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn recently_used_mode_ignores_a_previous_session_that_left_the_list() {
+        // Filtered out by the active space, or archived from another device.
+        // Standing down hands the press to the drawn order.
+        let list = order(&["a", "b", "c"]);
+        assert_eq!(recently_used_target(&list, Some("a"), Some("gone")), None);
+    }
+
+    #[test]
+    fn recently_used_mode_stands_down_without_a_current_session() {
+        // The new-session canvas has nothing to toggle back from.
+        let list = order(&["a", "b", "c"]);
+        assert_eq!(recently_used_target(&list, None, Some("a")), None);
+        assert_eq!(recently_used_target(&list, Some("a"), None), None);
+    }
+
+    #[test]
+    fn recently_used_mode_never_targets_the_current_session() {
+        let list = order(&["a", "b", "c"]);
+        assert_eq!(recently_used_target(&list, Some("a"), Some("a")), None);
+    }
 }
