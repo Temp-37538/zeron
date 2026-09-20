@@ -11,10 +11,15 @@
 //!
 //! Two server generations are spoken, detected at boot from the health
 //! endpoints ([`Protocol`]): the 1.18 "v1" wire (verified against 1.18.31)
-//! and the 2.x `/api/*` wire (verified against 2.0.3):
+//! and the 2.x `/api/*` wire (verified against 2.0.3 and 2.0.8):
 //! - spawn `opencode serve --port <free> --hostname 127.0.0.1` with
 //!   `OPENCODE_SERVER_PASSWORD=<uuid>` (HTTP Basic, username `opencode`);
-//!   readiness + protocol = `GET /api/health` vs `GET /global/health`.
+//!   readiness + protocol = `GET /api/info` (2.0.8+, carries
+//!   `ServerInfo.version`) or `GET /api/health` (2.0.0–2.0.3) vs
+//!   `GET /global/health` (1.x). Every probe must answer JSON carrying a
+//!   `version` string, so 1.x still resolves through its own endpoint: its
+//!   `/api/health` answers `{"healthy":true}` with no version, and 2.0.8
+//!   serves its web UI on `/global/health` (both observed live).
 //! - one global SSE bus (`GET /api/event` on 2.x, `GET /global/event` on
 //!   1.x) carries every session's traffic, child (subagent) sessions
 //!   included, token-level. 2.x frames are rewritten into the 1.x payload
@@ -27,6 +32,10 @@
 //!   after busy is authoritative, not a lull.
 //! - reasoning streams as reasoning parts on both wires →
 //!   [`AgentEvent::ReasoningDelta`], the thinking feed.
+//! - 2.0.8 replaced `question.asked` with a form system
+//!   (`/api/session/{id}/form`). Forms ride the same input bridge and the
+//!   same `InputRequested` / `InputResolved` lifecycle; the 1.x question
+//!   path stays for older servers.
 //!
 //! Failure surfacing (the #169 class): a dying provider is VISIBLE here —
 //! `session.status{type:"retry", attempt, message}` streams per attempt.
@@ -36,7 +45,7 @@
 //! [`default_stall_bound`] (`ZERON_OPENCODE_STALL_MS`, 0 disables) errors
 //! out instead of spinning "Working" forever.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,6 +73,18 @@ const STARTUP_TIMEOUT_ENV: &str = "ZERON_OPENCODE_STARTUP_TIMEOUT_SECS";
 
 /// Health-poll cadence while the server boots.
 const HEALTH_POLL: Duration = Duration::from_millis(150);
+
+/// 2.x catalog warm-up: `/api/model` serves an empty list for minutes on a
+/// cold, plugin-heavy boot while models.dev sync and MCP servers settle
+/// (observed live on 2.0.8; the official docs: "The snapshot may precede
+/// initial plugin settlement"). Poll long enough to win that race, then
+/// believe the empty list.
+const V2_CATALOG_RETRY_DELAY: Duration = Duration::from_secs(3);
+const V2_CATALOG_ATTEMPTS: u32 = 60;
+
+/// Bound on the form list fetch: `form.created` is handled inline by the bus
+/// loop, so a parked server must not stall event processing.
+const FORM_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Bound on ordinary (non-SSE) HTTP calls: everything is loopback and the
 /// only slow route is a cold /provider catalog. The synchronous per-turn
@@ -405,7 +426,8 @@ struct Server {
     auth: Option<String>,
     client: reqwest::Client,
     stderr_tail: crate::StderrTail,
-    /// Wire generation, resolved once via the health endpoints.
+    /// Wire generation, resolved once via the health probes
+    /// (`/api/info`, `/api/health`, `/global/health`).
     protocol: tokio::sync::OnceCell<Protocol>,
 }
 
@@ -419,16 +441,21 @@ enum Protocol {
 }
 
 impl Protocol {
-    /// One readiness poll across both generations. 2.x answers
-    /// `GET /api/health` with `{healthy, version}` and serves its web UI on
-    /// `/global/health`; 1.x answers `GET /global/health` with
-    /// `{healthy, version}` AND also serves `/api/health` — with
-    /// `{"healthy":true}`, no version (both observed live). The version
-    /// field is the only unambiguous discriminator. `None` = still booting.
+    /// One readiness poll across both generations. 2.0.8+ answers
+    /// `GET /api/info` with `{version, pid, urls, paths}` and serves its web
+    /// UI on `/global/health` (observed live, 2.0.8); 2.0.0–2.0.3 answered
+    /// `GET /api/health` with `{healthy, version}`; 1.x answers
+    /// `GET /global/health` with `{healthy, version}` AND also serves
+    /// `/api/health` — with `{"healthy":true}`, no version (both observed
+    /// live). The version field is the only unambiguous discriminator. The
+    /// probe order matters: 2.0.8 answers `/api/health` with 404 and
+    /// `/global/health` with the SPA's HTML, both of which the version guard
+    /// rejects, so `/api/info` must be tried first. `None` = still booting.
     async fn detect(server: &Server) -> Option<Self> {
         for (path, protocol) in [
-            ("/api/health", Protocol::V2),
-            ("/global/health", Protocol::V1),
+            ("/api/info", Protocol::V2),      // 2.0.8+
+            ("/api/health", Protocol::V2),    // 2.0.0 - 2.0.3
+            ("/global/health", Protocol::V1), // 1.18.x
         ] {
             if let Ok(resp) = server.get_raw(path).await
                 && resp.status().is_success()
@@ -660,6 +687,33 @@ impl Server {
         Ok((status, text))
     }
 
+    /// DELETE returning the decoded body (204 = `Null`). Used by the 2.0.8
+    /// form cancel route.
+    async fn delete_json(
+        &self,
+        path: &str,
+        directory: Option<&str>,
+    ) -> Result<Value, HarnessError> {
+        let req = self
+            .request(reqwest::Method::DELETE, path)
+            .timeout(CALL_TIMEOUT);
+        let resp = self
+            .scoped(req, directory)
+            .await
+            .send()
+            .await
+            .map_err(|e| HarnessError::Protocol(format!("opencode DELETE {path}: {e}")))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(HarnessError::Protocol(format!(
+                "opencode DELETE {path}: {status} {}",
+                truncate_body(&text)
+            )));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
     /// Directory scope: the server's per-request instance selector. V1 takes
     /// it as a query param (plus header, matching the official SDK); V2's
     /// strict query validation rejects unknown params — there the header
@@ -711,13 +765,15 @@ impl Server {
             Protocol::V2 => {
                 // The 2.x catalog syncs from models.dev shortly after the
                 // health endpoint opens: an empty list right then is a race,
-                // not a fact — poll briefly before believing it.
-                for attempt in 0..5 {
+                // not a fact — poll before believing it. A cold, plugin-heavy
+                // boot measured 2-3 minutes before the first non-empty answer
+                // (2.0.8), so the window is minutes, not seconds.
+                for attempt in 0..V2_CATALOG_ATTEMPTS {
                     let list: V2ModelList = self.get("/api/model", directory).await?;
-                    if !list.data.is_empty() || attempt == 4 {
+                    if !list.data.is_empty() || attempt + 1 == V2_CATALOG_ATTEMPTS {
                         return Ok(catalog_from_v2_models(list.data));
                     }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::time::sleep(V2_CATALOG_RETRY_DELAY).await;
                 }
                 unreachable!("loop returns on the last attempt")
             }
@@ -782,6 +838,45 @@ impl Server {
         self.post_json(&path, directory, &json!({ "model": model_ref }))
             .await
             .map(|_| ())
+    }
+
+    /// 2.0.8 forms: `GET /api/session/{id}/form` lists the session's pending
+    /// forms (`{data: [Form.Info]}`). The `form.created` frame itself is not
+    /// captured live, so the driver re-reads server state instead of trusting
+    /// the event payload — the list is the authoritative shape.
+    async fn forms_wire(
+        &self,
+        session_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Vec<Value>, HarnessError> {
+        let path = format!("/api/session/{session_id}/form");
+        let raw = self.get_json(&path, directory).await?;
+        Ok(unwrap_data(raw).as_array().cloned().unwrap_or_default())
+    }
+
+    /// Answer one pending form: `{answer: {fieldKey: value}}`, values typed
+    /// per field (string / number / boolean / array for `multiselect`).
+    async fn form_reply(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        answer: &Value,
+        directory: Option<&str>,
+    ) -> Result<Value, HarnessError> {
+        let path = format!("/api/session/{session_id}/form/{form_id}/reply");
+        self.post_json(&path, directory, &json!({ "answer": answer }))
+            .await
+    }
+
+    /// Decline a pending form (the 2.x equivalent of `question/reject`).
+    async fn form_cancel(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        directory: Option<&str>,
+    ) -> Result<Value, HarnessError> {
+        let path = format!("/api/session/{session_id}/form/{form_id}");
+        self.delete_json(&path, directory).await
     }
 }
 
@@ -1408,6 +1503,8 @@ async fn run_session(session: Session) {
     let mut pending_spawns: VecDeque<PendingSpawn> = VecDeque::new();
     // Child sessions created before their spawn chip was seen (id → title).
     let mut unbound_children: HashMap<String, String> = HashMap::new();
+    // 2.0.8 form ids already surfaced on the input panel.
+    let mut forms_seen: HashSet<String> = HashSet::new();
     let mut queued_steers: VecDeque<String> = VecDeque::new();
     let mut steering_open = true;
     let mut interrupt_requested = false;
@@ -1684,6 +1781,7 @@ async fn run_session(session: Session) {
                             children: &mut children,
                             pending_spawns: &mut pending_spawns,
                             unbound_children: &mut unbound_children,
+                            forms_seen: &mut forms_seen,
                             turn: &mut turn,
                             pending_usage: &mut pending_usage,
                             context_windows: &context_windows,
@@ -1925,15 +2023,19 @@ async fn post_prompt(
         let name = split.next().unwrap_or_default();
         let arguments = split.next().unwrap_or_default().trim().to_owned();
         if !name.is_empty() && commands.iter().any(|c| c.name == name) {
-            // 1.x names the args `arguments`; 2.x `text`.
-            let (path, cmd_body) = match protocol {
+            // 1.x names the command and its arguments `command`/`arguments`;
+            // 2.0.8 renamed them `name`/`text`. 2.0.0-2.0.3 spoke the old keys
+            // on the same route, so a 400 falls back to them once.
+            let (path, cmd_body, legacy_body) = match protocol {
                 Protocol::V1 => (
                     format!("/session/{session_id}/command"),
                     json!({ "command": name, "arguments": arguments }),
+                    None,
                 ),
                 Protocol::V2 => (
                     format!("/api/session/{session_id}/command"),
-                    json!({ "command": name, "text": arguments }),
+                    json!({ "name": name, "text": arguments }),
+                    Some(json!({ "command": name, "text": arguments })),
                 ),
             };
             let server_base = server.base.clone();
@@ -1957,11 +2059,28 @@ async fn post_prompt(
                     .request(reqwest::Method::POST, &path_owned)
                     .json(&cmd_body);
                 req = server.scoped(req, dir_owned.as_deref()).await;
-                if let Err(e) = req.send().await {
-                    tracing::debug!(
-                        target: "zeron_harness::opencode",
-                        "command turn failed: {e}"
-                    );
+                match req.send().await {
+                    Ok(resp) if resp.status() == reqwest::StatusCode::BAD_REQUEST => {
+                        if let Some(legacy) = &legacy_body {
+                            let mut retry = server
+                                .request(reqwest::Method::POST, &path_owned)
+                                .json(legacy);
+                            retry = server.scoped(retry, dir_owned.as_deref()).await;
+                            if let Err(e) = retry.send().await {
+                                tracing::debug!(
+                                    target: "zeron_harness::opencode",
+                                    "legacy command turn failed: {e}"
+                                );
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "zeron_harness::opencode",
+                            "command turn failed: {e}"
+                        );
+                    }
                 }
             });
             return Ok(());
@@ -2018,6 +2137,10 @@ struct BusCtx<'a> {
     children: &'a mut HashMap<String, ChildRun>,
     pending_spawns: &'a mut VecDeque<PendingSpawn>,
     unbound_children: &'a mut HashMap<String, String>,
+    /// Form ids already surfaced on the input panel this run (2.0.8 forms:
+    /// the event may re-deliver and the list fetch returns every pending
+    /// form, so the id gates the panel request).
+    forms_seen: &'a mut HashSet<String>,
     turn: &'a mut TurnState,
     pending_usage: &'a mut Option<AgentEvent>,
     context_windows: &'a HashMap<String, u64>,
@@ -2070,6 +2193,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
         children,
         pending_spawns,
         unbound_children,
+        forms_seen,
         turn,
         pending_usage,
         context_windows,
@@ -2384,17 +2508,24 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             };
             let session = session.to_owned();
             let protocol = server.protocol().await;
-            // 1.x: global permission endpoint + a session-scoped fallback;
-            // 2.x: the reply rides the session's permission route
-            // (`{"reply": "once" | "always" | "reject"}`).
-            let (reply_path, fallback_path) = match protocol {
+            // 1.x: global permission endpoint + a session-scoped fallback,
+            // keyed `reply` / `response`; 2.0.8+: the session's permission
+            // route with `{"decision": "once" | "always" | "reject"}`.
+            // 2.0.0-2.0.3 took `{"reply": ...}` on that same route, retried
+            // as a fallback when the decision body is rejected.
+            let (reply_path, primary_key, fallback) = match protocol {
                 Protocol::V1 => (
                     format!("/permission/{id}/reply"),
-                    Some(format!("/session/{session}/permissions/{id}")),
+                    "reply",
+                    Some((format!("/session/{session}/permissions/{id}"), "response")),
                 ),
                 Protocol::V2 => (
                     format!("/api/session/{session}/permission/{id}/reply"),
-                    None,
+                    "decision",
+                    Some((
+                        format!("/api/session/{session}/permission/{id}/reply"),
+                        "reply",
+                    )),
                 ),
             };
             let base = server.base.clone();
@@ -2430,26 +2561,33 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                                     .iter()
                                     .any(|label| label.eq_ignore_ascii_case("yes"))
                         });
-                // V2 "always" writes durable project-wide permission rules.
+                // 2.x "always" writes durable project-wide permission rules.
                 // Approval of this request must not grant future runs access.
                 let reply = if allowed { "once" } else { "reject" };
-                if server
-                    .post_json(
-                        &reply_path,
-                        dir_owned.as_deref(),
-                        &json!({ "reply": reply }),
-                    )
-                    .await
-                    .is_err()
-                    && let Some(fallback_path) = fallback_path
+                let body_with = |key: &str| {
+                    let mut map = serde_json::Map::new();
+                    map.insert(key.to_owned(), json!(reply));
+                    Value::Object(map)
+                };
+                let mut sent = server
+                    .post_json(&reply_path, dir_owned.as_deref(), &body_with(primary_key))
+                    .await;
+                if sent.is_err()
+                    && let Some((fallback_path, fallback_key)) = fallback
                 {
-                    let _ = server
+                    sent = server
                         .post_json(
                             &fallback_path,
                             dir_owned.as_deref(),
-                            &json!({ "response": reply }),
+                            &body_with(fallback_key),
                         )
                         .await;
+                }
+                if let Err(e) = sent {
+                    tracing::debug!(
+                        target: "zeron_harness::opencode",
+                        "permission reply failed: {e}"
+                    );
                 }
             });
             BusOutcome::Continue
@@ -2539,6 +2677,84 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                     .await;
             });
             BusOutcome::Continue
+        }
+        "form.created" => {
+            // 2.0.8 replaced `question.asked` with forms. The frame's own
+            // payload was not captured live, so when it names no session the
+            // driver probes every session this run owns; a named session must
+            // still be ours (same rule as questions).
+            let targets: Vec<String> = match event_session {
+                Some(session)
+                    if session == session_id
+                        || children.get(session).is_some_and(|child| !child.done)
+                        || unbound_children.contains_key(session) =>
+                {
+                    vec![session.to_owned()]
+                }
+                Some(_) => return BusOutcome::Continue,
+                None => {
+                    let mut targets = vec![session_id.to_owned()];
+                    targets.extend(
+                        children
+                            .iter()
+                            .filter(|(_, child)| !child.done)
+                            .map(|(id, _)| id.clone()),
+                    );
+                    targets.extend(unbound_children.keys().cloned());
+                    targets
+                }
+            };
+            // The pending list is the authoritative shape.
+            let mut forms = Vec::new();
+            for target in &targets {
+                match tokio::time::timeout(FORM_LIST_TIMEOUT, server.forms_wire(target, dir)).await
+                {
+                    Ok(Ok(list)) => {
+                        forms.extend(list.into_iter().map(|form| (target.clone(), form)));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            target: "zeron_harness::opencode",
+                            "form list failed for {target}: {e}"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            target: "zeron_harness::opencode",
+                            "form list timed out for {target}"
+                        );
+                    }
+                }
+            }
+            for (target, form) in forms {
+                let session = form
+                    .get("sessionID")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&target);
+                let Some(plan) = FormPlan::from_wire(&form, session) else {
+                    continue;
+                };
+                if !forms_seen.insert(plan.id.clone()) {
+                    continue;
+                }
+                spawn_form_reply(server, dir, plan, request_input, event_tx);
+            }
+            BusOutcome::Continue
+        }
+        "form.resolved" => {
+            // `form.replied` / `form.cancelled` from the server (answered in
+            // another client, or cancelled): close our panel chip.
+            let id = props.get("id").and_then(Value::as_str).unwrap_or_default();
+            if !forms_seen.remove(id) {
+                return BusOutcome::Continue;
+            }
+            forward(
+                event_tx,
+                vec![AgentEvent::InputResolved {
+                    request_id: id.to_owned(),
+                }],
+            )
+            .await
         }
         _ => BusOutcome::Continue,
     }
@@ -2781,14 +2997,17 @@ fn part_snapshot_events(
                     id: call_id.clone(),
                     call: oc_tool_call(tool, &input),
                 });
-                // A task spawn on the MAIN feed registers a pending chip so
-                // the child's session.created (or its metadata) can bind.
-                if tool == "task"
-                    && is_main
-                    && let Some((children, pending, unbound)) = spawn_ctx
-                {
-                    register_spawn(children, pending, unbound, part, part_id, &input);
-                }
+            }
+            // A task spawn on the MAIN feed registers a pending chip so the
+            // child's session.created (or its metadata) can bind. EVERY
+            // snapshot re-runs this: 2.0.8 presents the child id only on the
+            // later `progress` / `success` frames, after the chip already
+            // opened (the old `state.metadata.sessionId` on `called` is gone).
+            if tool == "task"
+                && is_main
+                && let Some((children, pending, unbound)) = spawn_ctx
+            {
+                register_spawn(children, pending, unbound, part, part_id, &input);
             }
             if entry.tool_started && !entry.tool_done && matches!(status, "completed" | "error") {
                 entry.tool_done = true;
@@ -2817,8 +3036,9 @@ fn part_snapshot_events(
 }
 
 /// Register a `task` spawn chip and bind it eagerly when the tool's own
-/// metadata already names the child session (opencode stamps
-/// `state.metadata.sessionId` at spawn).
+/// metadata names the child session. 2.0.8 stamps that metadata only on the
+/// later `progress` / `success` frames, so the call site re-runs this on
+/// every snapshot and a chip can adopt its child after it exists.
 fn register_spawn(
     children: &mut HashMap<String, ChildRun>,
     pending: &mut VecDeque<PendingSpawn>,
@@ -2827,17 +3047,41 @@ fn register_spawn(
     part_id: &str,
     input: &Value,
 ) {
-    let known = pending.iter().any(|p| p.tool_part_id == part_id)
-        || children.values().any(|c| c.parent_tool_use_id == part_id);
-    if known {
-        return;
-    }
     let child_id = part
         .get("state")
         .and_then(|s| s.get("metadata"))
         .and_then(|m| m.get("sessionId").or_else(|| m.get("sessionID")))
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let known = pending.iter().any(|p| p.tool_part_id == part_id)
+        || children.values().any(|c| c.parent_tool_use_id == part_id);
+    if known {
+        // The chip may have been registered by a frame that carried no input
+        // (2.0.8's bare `input.started`): back-fill the description so title
+        // matching still works when the metadata never names the child.
+        if let Some(entry) = pending.iter_mut().find(|p| p.tool_part_id == part_id)
+            && entry.description.is_empty()
+            && let Some(description) = input.get("description").and_then(Value::as_str)
+        {
+            entry.description = description.to_owned();
+        }
+        // 2.0.8 delivers the child binding LATE (the `progress` / `success`
+        // metadata): a chip registered by an earlier frame adopts the child
+        // here instead of waiting on a title match or `session.created`.
+        if !child_id.is_empty() && !children.contains_key(child_id) {
+            pending.retain(|p| p.tool_part_id != part_id);
+            unbound.remove(child_id);
+            children.insert(
+                child_id.to_owned(),
+                ChildRun {
+                    parent_tool_use_id: part_id.to_owned(),
+                    feed: SessionFeed::default(),
+                    done: false,
+                },
+            );
+        }
+        return;
+    }
     if !child_id.is_empty() && !children.contains_key(child_id) {
         unbound.remove(child_id);
         children.insert(
@@ -2960,6 +3204,282 @@ fn map_questions(props: &Value) -> Vec<UserInputQuestion> {
         .unwrap_or_default()
 }
 
+/// A 2.0.8 form projected onto the input panel: one `UserInputQuestion` per
+/// visible field, keyed by the field key (the reply is a key → value map, so
+/// positional question ids would not survive the round trip).
+struct FormPlan {
+    id: String,
+    session_id: String,
+    questions: Vec<UserInputQuestion>,
+    fields: Vec<FormFieldPlan>,
+}
+
+struct FormFieldPlan {
+    key: String,
+    /// `string` | `number` | `integer` | `boolean` | `multiselect` | `external`.
+    kind: String,
+    required: bool,
+    default: Option<Value>,
+    /// (label, wire value) for choice fields; empty for free-form strings.
+    options: Vec<(String, Value)>,
+}
+
+impl FormPlan {
+    /// Project one `Form.Info` (`{id, sessionID, title, fields}`); `None`
+    /// when nothing is answerable (no visible field).
+    fn from_wire(form: &Value, session_id: &str) -> Option<Self> {
+        let id = form.get("id").and_then(Value::as_str)?.to_owned();
+        let fields = form.get("fields").and_then(Value::as_array)?;
+        let mut questions = Vec::new();
+        let mut plans = Vec::new();
+        for field in fields {
+            let Some(key) = field.get("key").and_then(Value::as_str) else {
+                continue;
+            };
+            if field.get("hidden").and_then(Value::as_bool).unwrap_or(false) {
+                continue;
+            }
+            let kind = field
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("string")
+                .to_owned();
+            let title = field
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(key)
+                .to_owned();
+            let description = field
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or(&title)
+                .to_owned();
+            let options: Vec<(String, Value)> = field
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|opt| {
+                            let label = opt.get("label").and_then(Value::as_str)?;
+                            Some((
+                                label.to_owned(),
+                                opt.get("value").cloned().unwrap_or_else(|| json!(label)),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // The panel speaks labels only: choice fields render theirs, a
+            // boolean its Yes/No pair, and a free-form string renders none
+            // (the composer's typed override arrives as the label).
+            let panel_options: Vec<String> = match kind.as_str() {
+                "boolean" => vec!["Yes".to_owned(), "No".to_owned()],
+                _ if !options.is_empty() => options.iter().map(|(l, _)| l.clone()).collect(),
+                _ => Vec::new(),
+            };
+            questions.push(UserInputQuestion {
+                id: key.to_owned(),
+                header: title,
+                question: description,
+                options: panel_options,
+                multi_select: kind == "multiselect",
+            });
+            plans.push(FormFieldPlan {
+                key: key.to_owned(),
+                kind,
+                required: field
+                    .get("required")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                default: field.get("default").cloned().filter(|v| !v.is_null()),
+                options,
+            });
+        }
+        if questions.is_empty() {
+            return None;
+        }
+        Some(Self {
+            id,
+            session_id: session_id.to_owned(),
+            questions,
+            fields: plans,
+        })
+    }
+
+    /// Fold the panel's answers into the reply's `answer` object, keyed by
+    /// field. `Err` = an answer the panel cannot express (`external`, a
+    /// required field left empty, an unparseable number): the caller declines
+    /// the whole form rather than submitting a partial one.
+    fn answer(&self, answers: &[UserInputAnswer]) -> Result<Value, String> {
+        let mut out = serde_json::Map::new();
+        for field in &self.fields {
+            let labels = answers
+                .iter()
+                .find(|a| a.question_id == field.key)
+                .map(|a| a.labels.as_slice())
+                .unwrap_or_default();
+            if let Some(value) = field.value(labels)? {
+                out.insert(field.key.clone(), value);
+            }
+        }
+        Ok(Value::Object(out))
+    }
+}
+
+impl FormFieldPlan {
+    /// The wire value for one field; `Ok(None)` = omitted (optional, no
+    /// answer and no default).
+    fn value(&self, labels: &[String]) -> Result<Option<Value>, String> {
+        // `external` fields (auth flows) have no in-panel answer: always
+        // decline the whole form, answered or not.
+        if self.kind == "external" {
+            return Err(format!(
+                "field `{}` needs an out-of-band auth flow the panel cannot drive",
+                self.key
+            ));
+        }
+        let raw = labels
+            .iter()
+            .map(|label| label.trim())
+            .find(|label| !label.is_empty());
+        let Some(raw) = raw else {
+            if let Some(default) = &self.default {
+                return Ok(Some(default.clone()));
+            }
+            if self.required {
+                return Err(format!("required field `{}` was left empty", self.key));
+            }
+            return Ok(None);
+        };
+        match self.kind.as_str() {
+            "multiselect" => Ok(Some(Value::Array(
+                labels
+                    .iter()
+                    .map(|label| label.trim())
+                    .filter(|label| !label.is_empty())
+                    .map(|label| self.option_value(label).unwrap_or_else(|| json!(label)))
+                    .collect(),
+            ))),
+            "boolean" => {
+                if let Some(value) = self.option_value(raw).filter(Value::is_boolean) {
+                    return Ok(Some(value));
+                }
+                Ok(Some(json!(
+                    raw.eq_ignore_ascii_case("yes") || raw.eq_ignore_ascii_case("true")
+                )))
+            }
+            "number" | "integer" => {
+                if let Some(value) = self.option_value(raw).filter(Value::is_number) {
+                    return Ok(Some(value));
+                }
+                let parsed = if self.kind == "integer" {
+                    raw.parse::<i64>().map(|n| json!(n)).ok()
+                } else {
+                    raw.parse::<f64>().map(|n| json!(n)).ok()
+                };
+                match parsed {
+                    Some(value) => Ok(Some(value)),
+                    None if self.required => {
+                        Err(format!("field `{}` expects a number, got `{raw}`", self.key))
+                    }
+                    None => Ok(None),
+                }
+            }
+            _ => Ok(Some(self.option_value(raw).unwrap_or_else(|| json!(raw)))),
+        }
+    }
+
+    fn option_value(&self, label: &str) -> Option<Value> {
+        self.options
+            .iter()
+            .find(|(candidate, _)| candidate == label)
+            .map(|(_, value)| value.clone())
+    }
+}
+
+/// Surface one form on the input bridge and answer it off the run loop.
+///
+/// The engine's input bridge owns the panel lifecycle: it mints its own
+/// request id and drops a harness-emitted `InputRequested` with an id it does
+/// not know, so the form id never rides that event — it only keys the reply
+/// route and the closing `InputResolved`. Empty answers (the panel dismissed,
+/// the turn drained) decline the form instead of submitting an empty one.
+fn spawn_form_reply(
+    server: &Server,
+    dir: Option<&str>,
+    plan: FormPlan,
+    request_input: &Arc<RequestInput>,
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+) {
+    let rx = (request_input)(plan.questions.clone());
+    let base = server.base.clone();
+    let auth = server.auth.clone();
+    let dir_owned = dir.map(str::to_owned);
+    let protocol_cell = server.protocol.clone();
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let server = Server {
+            child: None,
+            base,
+            auth,
+            client: http_client(),
+            stderr_tail: crate::StderrTail::default(),
+            protocol: protocol_cell,
+        };
+        let session_id = plan.session_id.clone();
+        let form_id = plan.id.clone();
+        let outcome = match rx.await {
+            Ok(answers) if !answers.is_empty() => match plan.answer(&answers) {
+                Ok(answer) => server
+                    .form_reply(&session_id, &form_id, &answer, dir_owned.as_deref())
+                    .await
+                    .map(|_| ()),
+                Err(reason) => {
+                    tracing::debug!(
+                        target: "zeron_harness::opencode",
+                        "declining opencode form {form_id}: {reason}"
+                    );
+                    // The panel cannot express this form: surface a chip
+                    // instead of silently dropping the request, then release
+                    // the server-side form.
+                    if tx
+                        .send(Ok(AgentEvent::Error {
+                            message: format!(
+                                "opencode form cannot be answered by this panel: {reason}"
+                            ),
+                        }))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    server
+                        .form_cancel(&session_id, &form_id, dir_owned.as_deref())
+                        .await
+                        .map(|_| ())
+                }
+            },
+            // Declined, dismissed, or drained by the turn ending: release the
+            // server-side form instead of leaving it pending forever.
+            Ok(_) | Err(_) => server
+                .form_cancel(&session_id, &form_id, dir_owned.as_deref())
+                .await
+                .map(|_| ()),
+        };
+        if let Err(e) = outcome {
+            tracing::debug!(
+                target: "zeron_harness::opencode",
+                "form reply failed: {e}"
+            );
+        }
+        let _ = tx
+            .send(Ok(AgentEvent::InputResolved {
+                request_id: form_id,
+            }))
+            .await;
+    });
+}
+
 /// Cap for tool outputs entering the event stream (journal keeps the rest).
 const OUTPUT_CAP: usize = 4096;
 
@@ -3068,6 +3588,10 @@ fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
 ///   `.input.ended` (args as text), `.called` (args as object),
 ///   `.success` (content array) / `.error`.
 /// - usage: `session.usage.updated` with the cumulative token totals.
+/// - 2.0.8 drift: the spawn tool is `subagent` (normalized back to `task`),
+///   `session.tool.progress` carries the child binding, `session.status` /
+///   `session.retry.scheduled` feed the retry ladder, and `form.*` replaces
+///   `question.asked` (the form itself is re-read over HTTP).
 ///
 /// `tool_names` tracks pending calls by session, message, and provider call id.
 type V2ToolKey = (String, String, String);
@@ -3076,6 +3600,28 @@ const MAX_PENDING_V2_TOOLS: usize = 4096;
 fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>) -> Vec<Value> {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     let data = event.get("data").cloned().unwrap_or(Value::Null);
+    // 2.0.8 forms: the frame payload was not captured live and the driver
+    // re-reads the pending list over HTTP, so these frames are forwarded
+    // even without a session id (the run loop then probes every session it
+    // owns). Everything else needs one to be routed.
+    if matches!(kind, "form.created" | "form.replied" | "form.cancelled") {
+        let event_type = if kind == "form.created" {
+            "form.created"
+        } else {
+            "form.resolved"
+        };
+        return vec![json!({
+            "type": event_type,
+            "properties": {
+                "sessionID": data.get("sessionID").cloned().unwrap_or(Value::Null),
+                "id": data
+                    .get("formID")
+                    .or_else(|| data.get("id"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }
+        })];
+    }
     if data
         .get("sessionID")
         .and_then(Value::as_str)
@@ -3179,7 +3725,14 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
         )],
         "session.tool.input.started" => {
             let id = data.get("id").and_then(Value::as_str).unwrap_or_default();
-            let name = data.get("name").and_then(Value::as_str).unwrap_or_default();
+            // 2.0.8 renamed the spawn tool `task` → `subagent`. The rest of
+            // the engine (chip naming, spawn registration, child binding)
+            // keys on `task`, so the wire name is normalized here, before it
+            // reaches the tool-name table every later frame reads.
+            let name = match data.get("name").and_then(Value::as_str).unwrap_or_default() {
+                "subagent" => "task",
+                other => other,
+            };
             tool_names.insert(tool_key(), name.to_owned());
             vec![v2_tool_part(
                 &data,
@@ -3200,6 +3753,25 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
             });
             vec![v2_tool_part(&data, id, name, &state)]
         }
+        "session.tool.progress" => {
+            let id = data.get("id").and_then(Value::as_str).unwrap_or_default();
+            let name = tool_names
+                .get(&tool_key())
+                .map(String::as_str)
+                .unwrap_or_default();
+            // 2.0.8: the child session id first appears here —
+            // `state.metadata.sessionID` is the late binding the subagent
+            // chip adopts (the old `state.metadata` on called is gone).
+            vec![v2_tool_part(
+                &data,
+                id,
+                name,
+                &json!({
+                    "status": "running",
+                    "metadata": data.get("metadata").cloned().unwrap_or(Value::Null),
+                }),
+            )]
+        }
         "session.tool.success" => {
             let id = data.get("id").and_then(Value::as_str).unwrap_or_default();
             let name = tool_names.remove(&tool_key()).unwrap_or_default();
@@ -3218,7 +3790,11 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
                 &data,
                 id,
                 &name,
-                &json!({ "status": "completed", "output": output }),
+                &json!({
+                    "status": "completed",
+                    "output": output,
+                    "metadata": data.get("metadata").cloned().unwrap_or(Value::Null),
+                }),
             )]
         }
         "session.tool.failed" | "session.tool.error" => {
@@ -3235,7 +3811,11 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
                 &data,
                 id,
                 &name,
-                &json!({ "status": "error", "error": message }),
+                &json!({
+                    "status": "error",
+                    "error": message,
+                    "metadata": data.get("metadata").cloned().unwrap_or(Value::Null),
+                }),
             )]
         }
         "session.usage.updated" => {
@@ -3259,6 +3839,34 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
                 }
             })]
         }
+        // 2.0.8 status/retry encodings: idle/busy pass through, and the
+        // dedicated retry event folds into the retry status the ladder
+        // (`handle_bus_event`'s thresholds) already reads. Whichever encoding
+        // the server actually emits, the turn keeps both paths.
+        "session.status" => vec![json!({
+            "type": "session.status",
+            "properties": {
+                "sessionID": session(),
+                "status": data.get("status").cloned().unwrap_or(Value::Null),
+            }
+        })],
+        "session.retry.scheduled" => vec![json!({
+            "type": "session.status",
+            "properties": {
+                "sessionID": session(),
+                "status": {
+                    "type": "retry",
+                    "attempt": data.get("attempt").cloned().unwrap_or(Value::Null),
+                    "message": data
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                }
+            }
+        })],
+        // 2.0.8 forms are forwarded before the session guard above (their
+        // payload was not captured live); nothing to normalize here.
         "session.created" => {
             let Some(id) = data.get("sessionID").and_then(Value::as_str) else {
                 return Vec::new();

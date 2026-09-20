@@ -26,14 +26,31 @@ impl TurnWire {
     }
 
     /// `v2` serves the 2.x wire (`/api/*` routes, `{data}` wrappers,
-    /// version-bearing `/api/health`); otherwise the 1.18 one.
+    /// version-bearing `/api/health` — the 2.0.0-2.0.3 shape); otherwise the
+    /// 1.18 one.
     async fn start_proto(queued: bool, v2: bool) -> Self {
-        Self::start_policy(queued, v2, true, None).await
+        Self::start_impl(queued, v2, false, true, None).await
+    }
+
+    /// 2.0.8's server shape: `/api/info` carries the version, `/api/health`
+    /// is gone (version-less here) and `/global/health` serves the web UI.
+    async fn start_modern(queued: bool) -> Self {
+        Self::start_impl(queued, true, true, true, None).await
     }
 
     async fn start_policy(
         queued: bool,
         v2: bool,
+        auto_approve: bool,
+        answer: Option<bool>,
+    ) -> Self {
+        Self::start_impl(queued, v2, false, auto_approve, answer).await
+    }
+
+    async fn start_impl(
+        queued: bool,
+        v2: bool,
+        modern: bool,
         auto_approve: bool,
         answer: Option<bool>,
     ) -> Self {
@@ -64,7 +81,14 @@ impl TurnWire {
                         }
                     };
                     let header = String::from_utf8_lossy(&request[..header_end]);
-                    let is_post = header.starts_with("POST ");
+                    let method = header
+                        .lines()
+                        .next()
+                        .unwrap()
+                        .split_whitespace()
+                        .next()
+                        .unwrap()
+                        .to_owned();
                     let path = header.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_owned();
                     let length = header.lines().find_map(|line| {
                         let (name, value) = line.split_once(':')?;
@@ -75,7 +99,7 @@ impl TurnWire {
                         if n == 0 { return; }
                         request.extend_from_slice(&buf[..n]);
                     }
-                    if is_post { recorded.lock().unwrap().push((path.clone(), serde_json::from_slice(&request[header_end..header_end+length]).unwrap_or(Value::Null))); }
+                    if method == "POST" || method == "DELETE" { recorded.lock().unwrap().push((path.clone(), serde_json::from_slice(&request[header_end..header_end+length]).unwrap_or(Value::Null))); }
                     if path == "/global/event" || path == "/api/event" {
                         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: connected\n\n").await.unwrap();
                         let mut events = bus_rx.lock().await.take().unwrap();
@@ -86,11 +110,21 @@ impl TurnWire {
                     }
                     let body = if v2 {
                         match path.as_str() {
+                            // 2.0.8: only /api/info carries a version; the old
+                            // health route is gone and /global/health serves
+                            // the web UI's HTML.
+                            "/api/info" if modern => r#"{"version":"2.0.8","pid":1,"urls":[],"paths":{"tmp":"/tmp"}}"#,
+                            "/api/health" if modern => "{}",
+                            "/global/health" if modern => "<!doctype html><html><body>opencode</body></html>",
                             "/api/health" => r#"{"healthy":true,"version":"2.0.3"}"#,
                             "/api/session" => r#"{"data":{"id":"fixture"}}"#,
                             "/api/command" => r#"{"data":[]}"#,
                             // Non-empty: the catalog-sync retry loop must not stall tests.
                             "/api/model" => r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":[{"id":"low"}],"enabled":true}]}"#,
+                            // Pending forms for the `form.created` wire test:
+                            // one answerable, one carrying an `external` field
+                            // the panel cannot drive (declined with a chip).
+                            "/api/session/fixture/form" => r#"{"data":[{"id":"frm_1","sessionID":"fixture","title":"Ask","fields":[{"key":"note","type":"string","title":"Note","description":"Write something"}]},{"id":"frm_2","sessionID":"fixture","title":"Sign in","fields":[{"key":"login","type":"external","title":"Login","required":true}]}]}"#,
                             _ => "{}",
                         }
                     } else {
@@ -1164,8 +1198,9 @@ async fn permissions_stay_session_scoped_and_never_persist_grants() {
             2,
             "foreign or ownerless permission was answered"
         );
+        let key = if v2 { "decision" } else { "reply" };
         for (path, body) in approvals {
-            assert_eq!(body["reply"], "once");
+            assert_eq!(body[key], "once");
             assert!(!path.contains("foreign") && !path.contains("missing"));
         }
     }
@@ -1197,7 +1232,7 @@ async fn permissions_without_auto_approve_require_an_explicit_answer() {
         })
         .await
         .unwrap();
-        assert_eq!(body["reply"], if accept { "once" } else { "reject" });
+        assert_eq!(body["decision"], if accept { "once" } else { "reject" });
     }
 }
 
@@ -1382,4 +1417,305 @@ async fn v2_recovered_step_failure_does_not_poison_successful_execution() {
     let (status, text) = wire.done().await;
     assert_eq!(status, DoneStatus::Completed);
     assert_eq!(text, "Recovered");
+}
+
+#[tokio::test]
+async fn v2_detection_resolves_through_api_info_when_health_is_gone() {
+    // 2.0.8 shape: `/api/health` answers a version-less JSON (the real
+    // server 404s it) and `/global/health` serves the SPA's HTML; only
+    // `/api/info` carries the version. A completed run proves the V2 wire
+    // was detected — otherwise session create would speak V1 against it.
+    let mut wire = TurnWire::start_modern(false).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
+    wire.v2("session.execution.succeeded", json!({"sessionID":"fixture"}));
+    let (status, _) = wire.done().await;
+    assert_eq!(status, DoneStatus::Completed);
+}
+
+#[tokio::test]
+async fn v2_subagent_progress_binds_the_child_to_the_spawn_chip() {
+    let mut wire = TurnWire::start_modern(false).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
+    // The spawn tool arrives as `subagent` on 2.0.8, and the child session
+    // id only shows up on a LATER `progress` frame — the chip is already
+    // pending by then.
+    wire.v2("session.tool.input.started", json!({
+        "sessionID":"fixture","assistantMessageID":"msg_a","id":"call_1","name":"subagent"}));
+    wire.v2("session.tool.called", json!({
+        "sessionID":"fixture","assistantMessageID":"msg_a","id":"call_1",
+        "input":{"agent":"explore","description":"Check the repo","prompt":"go"}}));
+    wire.v2("session.tool.progress", json!({
+        "sessionID":"fixture","assistantMessageID":"msg_a","id":"call_1",
+        "metadata":{"sessionID":"ses_child","status":"running"}}));
+    wire.v2("session.created", json!({
+        "sessionID":"ses_child","parentID":"fixture","title":"Check the repo (@explore subagent)"}));
+    // Child traffic must reach the stream tagged with the chip.
+    wire.v2("session.step.started", json!({
+        "sessionID":"ses_child","assistantMessageID":"msg_child"}));
+    wire.v2("session.text.ended", json!({
+        "sessionID":"ses_child","assistantMessageID":"msg_child","ordinal":0,"text":"done"}));
+    let tagged = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let AgentEvent::Subagent { parent_tool_use_id, event } =
+                wire.events.recv().await.unwrap().unwrap()
+                && let AgentEvent::TextDelta { text } = *event
+            {
+                return (parent_tool_use_id, text);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(tagged.1, "done");
+    assert!(!tagged.0.is_empty(), "child traffic must carry its chip id");
+    // The terminal `success` carries the same metadata; the chip settles.
+    wire.v2("session.tool.success", json!({
+        "sessionID":"fixture","assistantMessageID":"msg_a","id":"call_1",
+        "content":[{"text":"done"}],
+        "metadata":{"sessionID":"ses_child","status":"completed","truncated":false}}));
+    wire.v2("session.execution.succeeded", json!({"sessionID":"fixture"}));
+    let (status, _) = wire.done().await;
+    assert_eq!(status, DoneStatus::Completed);
+}
+
+#[tokio::test]
+async fn v2_forms_go_through_the_input_bridge_and_reply_by_field_key() {
+    // `form.created` carries no usable payload (not captured live): the
+    // driver re-reads `/api/session/{id}/form`, answers by field key, and
+    // declines the form whose `external` field the panel cannot drive.
+    let mut wire = TurnWire::start_policy(false, true, false, Some(true)).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
+    wire.v2("form.created", json!({"sessionID":"fixture","id":"frm_1"}));
+    // A frame without a session id (the payload was not captured live) still
+    // probes the sessions this run owns; the ids dedupe.
+    wire.v2("form.created", json!({}));
+    let body = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some((_, body)) = wire
+                .posts
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(p, _)| p == "/api/session/fixture/form/frm_1/reply")
+            {
+                break body.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(body, json!({"answer":{"note":"Yes"}}));
+    // The unanswerable form is cancelled through DELETE, not answered.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if wire
+                .posts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(p, _)| p == "/api/session/fixture/form/frm_2")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    wire.v2("session.execution.succeeded", json!({"sessionID":"fixture"}));
+    let (status, errors, resolved) = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut errors = Vec::new();
+        let mut resolved = Vec::new();
+        loop {
+            match wire.events.recv().await.unwrap().unwrap() {
+                AgentEvent::Error { message } => errors.push(message),
+                AgentEvent::InputResolved { request_id } => resolved.push(request_id),
+                AgentEvent::Done { status, .. } => return (status, errors, resolved),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status, DoneStatus::Completed);
+    assert!(resolved.iter().any(|id| id == "frm_1"));
+    assert!(resolved.iter().any(|id| id == "frm_2"));
+    assert!(
+        errors.iter().any(|message| message.contains("auth flow")),
+        "the declined form must surface a chip: {errors:?}"
+    );
+}
+
+#[test]
+fn v2_subagent_frames_normalize_to_task_and_carry_late_metadata() {
+    let mut tools = HashMap::new();
+    let out = normalize_v2_frame(
+        json!({"type":"session.tool.input.started","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","id":"call_1","name":"subagent"}}),
+        &mut tools,
+    );
+    assert_eq!(out[0]["properties"]["part"]["tool"], json!("task"));
+    let out = normalize_v2_frame(
+        json!({"type":"session.tool.progress","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","id":"call_1",
+            "metadata":{"sessionID":"ses_child","status":"running"}}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out[0]["properties"]["part"]["state"]["metadata"]["sessionID"],
+        json!("ses_child")
+    );
+    let out = normalize_v2_frame(
+        json!({"type":"session.tool.success","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","id":"call_1",
+            "content":[{"text":"done"}],
+            "metadata":{"sessionID":"ses_child","status":"completed","truncated":false}}}),
+        &mut tools,
+    );
+    assert_eq!(out[0]["properties"]["part"]["tool"], json!("task"));
+    assert_eq!(
+        out[0]["properties"]["part"]["state"]["status"],
+        json!("completed")
+    );
+    assert_eq!(
+        out[0]["properties"]["part"]["state"]["metadata"]["sessionID"],
+        json!("ses_child")
+    );
+}
+
+#[test]
+fn v2_retry_frames_feed_the_retry_ladder() {
+    let mut tools = HashMap::new();
+    let out = normalize_v2_frame(
+        json!({"type":"session.retry.scheduled","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","attempt":3,"at":0,
+            "error":{"type":"provider.auth","message":"nope"}}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"session.status","properties":{
+            "sessionID":"ses_1",
+            "status":{"type":"retry","attempt":3,"message":"nope"}}})]
+    );
+    let out = normalize_v2_frame(
+        json!({"type":"session.status","data":{
+            "sessionID":"ses_1","status":{"type":"busy"}}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"session.status","properties":{
+            "sessionID":"ses_1","status":{"type":"busy"}}})]
+    );
+}
+
+#[tokio::test]
+async fn v2_retry_exhaustion_aborts_the_turn() {
+    let mut wire = TurnWire::start_modern(false).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
+    wire.v2("session.retry.scheduled", json!({
+        "sessionID":"fixture","assistantMessageID":"msg_a","attempt":8,"at":0,
+        "error":{"type":"provider.auth","message":"nope"}}));
+    // The ladder aborts the session instead of retrying forever.
+    wire.request("/interrupt").await;
+    wire.v2("session.status", json!({"sessionID":"fixture","status":{"type":"idle"}}));
+    let (status, _) = wire.done().await;
+    assert_eq!(status, DoneStatus::Errored);
+}
+
+#[test]
+fn spawn_metadata_binds_a_chip_registered_before_the_child_existed() {
+    let mut children = HashMap::new();
+    let mut pending = VecDeque::new();
+    let mut unbound = HashMap::new();
+    // Opened with the description only: the child id is unknown, so the
+    // chip parks in `pending`.
+    let opened = json!({"id":"part_1","type":"tool","tool":"task",
+        "state":{"status":"running","input":{"description":"Check the repo"}}});
+    register_spawn(
+        &mut children,
+        &mut pending,
+        &mut unbound,
+        &opened,
+        "part_1",
+        &json!({"description":"Check the repo"}),
+    );
+    assert_eq!(pending.len(), 1);
+    // 2.0.8: the child id arrives later, on the progress metadata.
+    let progress = json!({"id":"part_1","type":"tool","tool":"task",
+        "state":{"status":"running","metadata":{"sessionID":"ses_child"}}});
+    register_spawn(
+        &mut children,
+        &mut pending,
+        &mut unbound,
+        &progress,
+        "part_1",
+        &json!({"description":"Check the repo"}),
+    );
+    assert!(pending.is_empty());
+    assert_eq!(
+        children.get("ses_child").map(|c| c.parent_tool_use_id.as_str()),
+        Some("part_1")
+    );
+}
+
+#[test]
+fn v2_forms_project_onto_the_input_panel_and_answer_by_key() {
+    let form = json!({
+        "id":"frm_1","sessionID":"ses_1","title":"Setup",
+        "fields":[
+            {"key":"mode","type":"string","title":"Mode",
+             "options":[{"value":"fast","label":"Fast"},{"value":"safe","label":"Safe"}],
+             "required":true},
+            {"key":"note","type":"string","title":"Note"},
+            {"key":"count","type":"integer","title":"Count"},
+            {"key":"tags","type":"multiselect","title":"Tags",
+             "options":[{"value":"a","label":"A"},{"value":"b","label":"B"}]},
+            {"key":"confirm","type":"boolean","title":"Confirm"},
+            {"key":"hidden","type":"string","hidden":true}
+        ]
+    });
+    let plan = FormPlan::from_wire(&form, "ses_1").expect("visible fields exist");
+    assert_eq!(plan.id, "frm_1");
+    assert_eq!(plan.questions.len(), 5, "the hidden field is not surfaced");
+    assert_eq!(plan.questions[0].id, "mode");
+    assert_eq!(plan.questions[0].options, vec!["Fast", "Safe"]);
+    assert!(plan.questions[3].multi_select);
+    assert_eq!(plan.questions[4].options, vec!["Yes", "No"]);
+    let answers = vec![
+        UserInputAnswer {
+            question_id: "mode".into(),
+            labels: vec!["Safe".into()],
+        },
+        UserInputAnswer {
+            question_id: "count".into(),
+            labels: vec!["3".into()],
+        },
+        UserInputAnswer {
+            question_id: "tags".into(),
+            labels: vec!["A".into(), "B".into()],
+        },
+        UserInputAnswer {
+            question_id: "confirm".into(),
+            labels: vec!["No".into()],
+        },
+    ];
+    let answer = plan.answer(&answers).expect("every field can be answered");
+    assert_eq!(
+        answer,
+        json!({"mode":"safe","count":3,"tags":["a","b"],"confirm":false})
+    );
+    // A required field the panel cannot answer (here: left empty) declines
+    // the form instead of submitting a partial answer.
+    assert!(plan.answer(&[]).is_err());
 }
