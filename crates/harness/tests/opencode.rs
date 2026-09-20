@@ -1,10 +1,14 @@
 //! Native opencode driver against a scripted in-test HTTP/SSE server.
 //!
-//! The fake speaks just enough of the v1 surface (`/global/health`,
-//! `/session`, `/session/{id}/prompt_async`, `/session/{id}/abort`,
-//! `/provider`, `/command`, `/global/event`) and hands the TEST full control
-//! of bus timing via `emit()` — the premature-done class is exactly about
-//! what happens between events, so the fixtures must own the clock.
+//! The fake speaks the v1 surface (`/global/health`, `/session`,
+//! `/session/{id}/prompt_async`, `/session/{id}/abort`, `/provider`,
+//! `/command`, `/global/event`) or, in `start_v2()` mode, the 2.x `/api/*`
+//! surface (`/api/info`, `/api/session`, `/api/session/{id}/prompt`,
+//! `/api/session/{id}/interrupt`, `/api/model`, `/api/command`,
+//! `/api/event`) — every shape captured live on a 2.0.10 server. Either way
+//! the TEST owns bus timing via `emit()` / `emit_v2()`: the premature-done
+//! class is exactly about what happens between events, so the fixtures must
+//! own the clock.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,9 +37,28 @@ struct FakeOpencode {
     backlog: Arc<Mutex<Vec<(u64, String)>>>,
     /// Recorded `(path, body)` of every POST.
     posts: Arc<Mutex<Vec<(String, Value)>>>,
+    /// Recorded `(method, path, body)` of every non-GET call.
+    calls: Arc<Mutex<Vec<(String, String, Value)>>>,
     providers: Arc<Mutex<Value>>,
-    /// Whether an SSE subscriber existed when the FIRST prompt_async landed
-    /// (the no-replay bus makes prompting before the subscription a real
+    /// Pending forms served on `GET /api/session/{id}/form` (2.x).
+    forms: Arc<Mutex<Value>>,
+    /// `Accept` header of the 2.x `/api/event` request (the route serves
+    /// nothing without `text/event-stream`).
+    sse_accept: Arc<Mutex<Option<String>>>,
+    /// Answers left on `GET /api/model` before the 2.x catalog turns
+    /// non-empty (the real server serves an empty list while models.dev
+    /// syncs and the driver must poll through it).
+    catalog_empty_left: Arc<Mutex<u32>>,
+    /// Answer the next 2.x `POST .../command` with 400 so the legacy body
+    /// fallback fires (2.0.0-2.0.3 spoke `{command, text}`).
+    reject_command_once: Arc<Mutex<bool>>,
+    /// Answer the next 2.x permission reply with 400 so the `{reply}` legacy
+    /// fallback fires (2.0.0-2.0.3 keyed the old body `reply`).
+    reject_permission_once: Arc<Mutex<bool>>,
+    /// Whether the fake speaks the 2.x `/api/*` wire.
+    v2: bool,
+    /// Whether an SSE subscriber existed when the FIRST prompt landed (the
+    /// no-replay bus makes prompting before the subscription a real
     /// event-loss race — observed live on fast-failing turns).
     first_prompt_had_subscriber: Arc<Mutex<Option<bool>>>,
     /// Leading 500s to answer `POST /session` with (the opencode
@@ -43,8 +66,25 @@ struct FakeOpencode {
     fail_session_creates: Arc<Mutex<u32>>,
 }
 
+/// Consume a one-shot rejection flag.
+fn take_once(flag: &Mutex<bool>) -> bool {
+    std::mem::replace(&mut *flag.lock().unwrap(), false)
+}
+
 impl FakeOpencode {
+    /// The 1.18 wire.
     async fn start() -> Self {
+        Self::start_proto(false).await
+    }
+
+    /// The 2.x wire, shaped like 2.0.8+ as captured live on 2.0.10:
+    /// `/api/info` carries the version, `/api/health` is gone, the web UI
+    /// answers `/global/health` with HTML, and the bus is `/api/event`.
+    async fn start_v2() -> Self {
+        Self::start_proto(true).await
+    }
+
+    async fn start_proto(v2: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let (events, _) = broadcast::channel::<(u64, String)>(256);
@@ -53,7 +93,14 @@ impl FakeOpencode {
             events: events.clone(),
             backlog: Arc::new(Mutex::new(Vec::new())),
             posts: Arc::new(Mutex::new(Vec::new())),
+            calls: Arc::new(Mutex::new(Vec::new())),
             providers: Arc::new(Mutex::new(json!({ "all": [], "default": {} }))),
+            forms: Arc::new(Mutex::new(json!([]))),
+            sse_accept: Arc::new(Mutex::new(None)),
+            catalog_empty_left: Arc::new(Mutex::new(0)),
+            reject_command_once: Arc::new(Mutex::new(false)),
+            reject_permission_once: Arc::new(Mutex::new(false)),
+            v2,
             first_prompt_had_subscriber: Arc::new(Mutex::new(None)),
             fail_session_creates: Arc::new(Mutex::new(0)),
         };
@@ -70,21 +117,40 @@ impl FakeOpencode {
         fake
     }
 
-    /// Push one bus event (the driver accepts both the bare and the
-    /// `/global/event` envelope; the fake uses the enveloped form).
-    fn emit(&self, payload: Value) {
-        let framed = format!(
-            "data: {}\n\n",
-            json!({ "directory": "/", "payload": payload })
-        );
+    fn push_frame(&self, framed: String) {
         let mut backlog = self.backlog.lock().unwrap();
         let seq = backlog.len() as u64;
         backlog.push((seq, framed.clone()));
         let _ = self.events.send((seq, framed));
     }
 
+    /// Push one 1.x bus event (the driver accepts both the bare and the
+    /// `/global/event` envelope; the fake uses the enveloped form).
+    fn emit(&self, payload: Value) {
+        let framed = format!(
+            "data: {}\n\n",
+            json!({ "directory": "/", "payload": payload })
+        );
+        self.push_frame(framed);
+    }
+
+    /// Push one raw 2.x `/api/event` frame — the shape captured live on
+    /// 2.0.10 (`{id, created, type, data}`; normalized by the driver).
+    fn emit_v2(&self, kind: &str, data: Value) {
+        let framed = format!(
+            "data: {}\n\n",
+            json!({ "id": format!("evt_{kind}"), "created": 0, "type": kind, "data": data })
+        );
+        self.push_frame(framed);
+    }
+
     fn set_providers(&self, providers: Value) {
         *self.providers.lock().unwrap() = providers;
+    }
+
+    /// Pending forms the 2.x `GET /api/session/{id}/form` route answers.
+    fn set_forms(&self, forms: Value) {
+        *self.forms.lock().unwrap() = forms;
     }
 
     fn posts_to(&self, path: &str) -> Vec<Value> {
@@ -94,6 +160,16 @@ impl FakeOpencode {
             .iter()
             .filter(|(p, _)| p == path)
             .map(|(_, b)| b.clone())
+            .collect()
+    }
+
+    fn calls_to(&self, method: &str, path: &str) -> Vec<Value> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == method && p == path)
+            .map(|(_, _, b)| b.clone())
             .collect()
     }
 
@@ -115,14 +191,16 @@ impl FakeOpencode {
             let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
             let mut lines = head.lines();
             let start = lines.next().unwrap_or_default().to_owned();
-            let content_length = lines
+            let headers: Vec<(String, String)> = lines
                 .filter_map(|l| {
                     let (k, v) = l.split_once(':')?;
-                    k.eq_ignore_ascii_case("content-length")
-                        .then(|| v.trim().parse::<usize>().ok())
-                        .flatten()
+                    Some((k.trim().to_ascii_lowercase(), v.trim().to_owned()))
                 })
-                .next()
+                .collect();
+            let content_length = headers
+                .iter()
+                .find(|(k, _)| k == "content-length")
+                .and_then(|(_, v)| v.parse::<usize>().ok())
                 .unwrap_or(0);
             while buf.len() < header_end + content_length {
                 match stream.read(&mut chunk).await {
@@ -139,7 +217,16 @@ impl FakeOpencode {
             let target = parts.next().unwrap_or_default().to_owned();
             let path = target.split('?').next().unwrap_or_default().to_owned();
 
-            if method == "GET" && path == "/global/event" {
+            let sse_path = if self.v2 { "/api/event" } else { "/global/event" };
+            if method == "GET" && path == sse_path {
+                if self.v2 {
+                    // The 2.x bus serves nothing without this header
+                    // (observed live on 2.0.3) — record it for assertions.
+                    *self.sse_accept.lock().unwrap() = headers
+                        .iter()
+                        .find(|(k, _)| k == "accept")
+                        .map(|(_, v)| v.clone());
+                }
                 // Subscribe FIRST, then snapshot the backlog: frames landing
                 // in between arrive on both channels and dedupe by sequence.
                 let mut rx = self.events.subscribe();
@@ -173,14 +260,37 @@ impl FakeOpencode {
                 return;
             }
 
-            if method == "POST" {
-                if path.ends_with("/prompt_async") {
-                    let mut first = self.first_prompt_had_subscriber.lock().unwrap();
-                    if first.is_none() {
-                        *first = Some(self.events.receiver_count() > 0);
-                    }
+            // 2.0.8 serves its web UI on `/global/health`: HTML, not JSON —
+            // the version guard must reject it and fall through to /api/info.
+            if self.v2 && method == "GET" && path == "/global/health" {
+                let html = "<!doctype html><html><body>opencode</body></html>";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n\
+                     content-length: {}\r\n\r\n{html}",
+                    html.len()
+                );
+                if stream.write_all(resp.as_bytes()).await.is_err() {
+                    return;
                 }
-                self.posts.lock().unwrap().push((path.clone(), body));
+                continue;
+            }
+
+            if method != "GET" {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), path.clone(), body.clone()));
+                if method == "POST" {
+                    // 2.x prompts land on `/prompt`; the gated first send is
+                    // the same no-replay race as 1.x `prompt_async`.
+                    if path.ends_with("/prompt_async") || path.ends_with("/prompt") {
+                        let mut first = self.first_prompt_had_subscriber.lock().unwrap();
+                        if first.is_none() {
+                            *first = Some(self.events.receiver_count() > 0);
+                        }
+                    }
+                    self.posts.lock().unwrap().push((path.clone(), body));
+                }
             }
             let (status, payload) = self.route(&method, &path);
             let body = payload.to_string();
@@ -196,6 +306,9 @@ impl FakeOpencode {
     }
 
     fn route(&self, method: &str, path: &str) -> (&'static str, Value) {
+        if self.v2 {
+            return self.route_v2(method, path);
+        }
         match (method, path) {
             ("GET", "/global/health") => ("200 OK", json!({ "healthy": true })),
             ("GET", "/provider") => ("200 OK", self.providers.lock().unwrap().clone()),
@@ -228,6 +341,84 @@ impl FakeOpencode {
             ("POST", p) if p.contains("/permission/") || p.contains("/question/") => {
                 ("200 OK", json!(true))
             }
+            _ => ("404 Not Found", json!({ "missing": path })),
+        }
+    }
+
+    /// The 2.x `/api/*` surface (2.0.8+ shape). `/global/health` is served
+    /// as HTML in `serve` and `/api/health` 404s, so only `/api/info`
+    /// carries a version.
+    fn route_v2(&self, method: &str, path: &str) -> (&'static str, Value) {
+        match (method, path) {
+            ("GET", "/api/info") => (
+                "200 OK",
+                json!({
+                    "version": "2.0.10",
+                    "pid": 4242,
+                    "urls": ["http://127.0.0.1:4096"],
+                    "paths": { "tmp": "/tmp" },
+                }),
+            ),
+            ("GET", "/api/health") => ("404 Not Found", json!({})),
+            ("GET", "/api/session/active") => ("200 OK", json!({ "data": {} })),
+            ("GET", "/api/model") => {
+                let mut left = self.catalog_empty_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return ("200 OK", json!({ "data": [] }));
+                }
+                (
+                    "200 OK",
+                    json!({ "data": [{
+                        "providerID": "opencode",
+                        "id": "test-model",
+                        "name": "Test Model",
+                        "limit": { "context": 100_000, "output": 8000 },
+                        "variants": [{ "id": "high" }],
+                        "enabled": true,
+                    }]}),
+                )
+            }
+            ("GET", "/api/command") => (
+                "200 OK",
+                json!({ "data": [{ "name": "init", "description": "Create AGENTS.md" }] }),
+            ),
+            ("POST", "/api/session") => ("200 OK", json!({ "data": { "id": "ses_test" } })),
+            ("GET", "/api/session/ses_resume") => {
+                ("200 OK", json!({ "data": { "id": "ses_resume" } }))
+            }
+            // The pending list is the authoritative form shape (`form.created`
+            // nests the same record under `data.form` — captured live).
+            ("GET", p) if p.ends_with("/form") => {
+                ("200 OK", json!({ "data": self.forms.lock().unwrap().clone() }))
+            }
+            ("POST", p) if p.ends_with("/model") => ("204 No Content", json!({})),
+            ("POST", p) if p.ends_with("/prompt") => ("200 OK", json!({ "data": {} })),
+            ("POST", p) if p.ends_with("/interrupt") => {
+                ("200 OK", json!({ "interrupted": true }))
+            }
+            ("POST", p) if p.ends_with("/command") => {
+                if take_once(&self.reject_command_once) {
+                    return ("400 Bad Request", json!({ "error": "unknown field `name`" }));
+                }
+                ("200 OK", json!({ "data": {} }))
+            }
+            ("POST", p) if p.contains("/permission/") => {
+                if take_once(&self.reject_permission_once) {
+                    return ("400 Bad Request", json!({ "error": "unknown field `decision`" }));
+                }
+                ("200 OK", json!({ "data": {} }))
+            }
+            // Answering or cancelling settles the pending form server-side.
+            ("POST", p) if p.contains("/form/") && p.ends_with("/reply") => {
+                *self.forms.lock().unwrap() = json!([]);
+                ("200 OK", json!({ "data": {} }))
+            }
+            ("DELETE", p) if p.contains("/form/") => {
+                *self.forms.lock().unwrap() = json!([]);
+                ("200 OK", json!({ "data": {} }))
+            }
+            ("GET", p) if p.starts_with("/api/session/") => ("404 Not Found", json!({})),
             _ => ("404 Not Found", json!({ "missing": path })),
         }
     }
@@ -299,6 +490,35 @@ fn idle(fake: &FakeOpencode, session: &str) {
     }));
 }
 
+/// Emit the captured 2.x opening frames of an assistant step.
+fn v2_assistant_message(fake: &FakeOpencode, session: &str, message: &str) {
+    fake.emit_v2("session.execution.started", json!({ "sessionID": session }));
+    fake.emit_v2(
+        "session.step.started",
+        json!({
+            "sessionID": session,
+            "agent": "build",
+            "model": { "id": "test-model", "providerID": "opencode", "variant": "default" },
+            "assistantMessageID": message,
+        }),
+    );
+}
+
+/// The captured 2.x turn end.
+fn v2_idle(fake: &FakeOpencode, session: &str) {
+    fake.emit_v2("session.execution.succeeded", json!({ "sessionID": session }));
+}
+
+/// Consume the two opening events every run emits (session + commands).
+async fn opening(
+    stream: &mut (impl futures::Stream<Item = Result<AgentEvent, HarnessError>> + Unpin),
+) {
+    let started = next_event(stream).await;
+    assert!(matches!(started, AgentEvent::SessionStarted { .. }));
+    let commands = next_event(stream).await;
+    assert!(matches!(commands, AgentEvent::AvailableCommands { .. }));
+}
+
 async fn next_event(
     stream: &mut (impl futures::Stream<Item = Result<AgentEvent, HarnessError>> + Unpin),
 ) -> AgentEvent {
@@ -309,19 +529,24 @@ async fn next_event(
         .expect("ok event")
 }
 
-/// Poll until `path` has received `n` POSTs; returns their bodies.
-async fn wait_posts(fake: &FakeOpencode, path: &str, n: usize) -> Vec<Value> {
+/// Poll until `(method, path)` has received `n` calls; returns their bodies.
+async fn wait_calls(fake: &FakeOpencode, method: &str, path: &str, n: usize) -> Vec<Value> {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let posts = fake.posts_to(path);
-            if posts.len() >= n {
-                return posts;
+            let calls = fake.calls_to(method, path);
+            if calls.len() >= n {
+                return calls;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("{path} never saw {n} posts"))
+    .unwrap_or_else(|_| panic!("{method} {path} never saw {n} calls"))
+}
+
+/// Poll until `path` has received `n` POSTs; returns their bodies.
+async fn wait_posts(fake: &FakeOpencode, path: &str, n: usize) -> Vec<Value> {
+    wait_calls(fake, "POST", path, n).await
 }
 
 /// Drain until a Done arrives; returns everything seen (Done last).
@@ -995,3 +1220,689 @@ async fn repeated_session_create_failure_stops_after_one_retry() {
         })
     ));
 }
+
+// ---------------------------------------------------------------------------
+// 2.x wire — every shape below was captured from a live 2.0.10 server
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn v2_detection_and_a_full_turn_ride_the_api_wire() {
+    // 2.0.8+ serves its web UI on `/global/health` (HTML) and 404s
+    // `/api/health`; only `/api/info` carries a version. A completed run
+    // proves the V2 wire was resolved — everything below uses `/api/*`.
+    let fake = FakeOpencode::start_v2().await;
+    let (controls, _steer, _token) = controls();
+    let mut req = request("hi");
+    req.model = Some("opencode/test-model".into());
+    req.reasoning = Some(ReasoningLevel::XHigh);
+    let mut stream = harness(&fake)
+        .run(req, controls)
+        .await
+        .expect("run starts");
+    let started = next_event(&mut stream).await;
+    assert!(matches!(
+        &started,
+        AgentEvent::SessionStarted { session_id, .. } if session_id == "ses_test"
+    ));
+    let commands = next_event(&mut stream).await;
+    assert!(matches!(
+        &commands,
+        AgentEvent::AvailableCommands { commands } if commands.len() == 1
+    ));
+
+    // 2.x sets the model (+ variant) once on the session; the catalog
+    // advertises `high`, so XHigh clamps to it. The prompt carries text and
+    // files only.
+    let models = wait_calls(&fake, "POST", "/api/session/ses_test/model", 1).await;
+    assert_eq!(
+        models[0]["model"],
+        json!({ "providerID": "opencode", "id": "test-model", "variant": "high" })
+    );
+    let prompts = wait_calls(&fake, "POST", "/api/session/ses_test/prompt", 1).await;
+    assert_eq!(prompts[0], json!({ "text": "hi", "files": [] }));
+    assert_eq!(
+        *fake.first_prompt_had_subscriber.lock().unwrap(),
+        Some(true),
+        "the first prompt must not be posted before the /api/event subscription exists"
+    );
+    assert_eq!(
+        fake.sse_accept.lock().unwrap().as_deref(),
+        Some("text/event-stream"),
+        "/api/event serves nothing without the SSE Accept header"
+    );
+
+    // The captured lifecycle: started → step.started → text delta → full-text
+    // snapshot (dedups to nothing) → succeeded settles Completed.
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+    fake.emit_v2(
+        "session.text.started",
+        json!({ "sessionID": "ses_test", "assistantMessageID": "msg_1", "ordinal": 0, "text": "" }),
+    );
+    fake.emit_v2(
+        "session.text.delta",
+        json!({ "sessionID": "ses_test", "assistantMessageID": "msg_1", "ordinal": 0, "delta": "Hello" }),
+    );
+    let text = next_event(&mut stream).await;
+    assert!(matches!(&text, AgentEvent::TextDelta { text } if text == "Hello"));
+    fake.emit_v2(
+        "session.text.ended",
+        json!({ "sessionID": "ses_test", "assistantMessageID": "msg_1", "ordinal": 0, "text": "Hello" }),
+    );
+    v2_idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.first(),
+        Some(AgentEvent::AssistantMessageCompleted { .. })
+    ));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            session_id: Some(sid),
+            ..
+        }) if sid == "ses_test"
+    ));
+}
+
+#[tokio::test]
+async fn v2_slash_command_sends_name_and_text() {
+    let fake = FakeOpencode::start_v2().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("/init the repo"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+
+    let commands = wait_calls(&fake, "POST", "/api/session/ses_test/command", 1).await;
+    assert_eq!(commands[0], json!({ "name": "init", "text": "the repo" }));
+    assert!(
+        fake.calls_to("POST", "/api/session/ses_test/prompt").is_empty(),
+        "a known slash command must not also post a prompt"
+    );
+
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+    v2_idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn v2_command_falls_back_to_the_legacy_body() {
+    // 2.0.0-2.0.3 spoke `{command, text}` on the same route and 400s the
+    // 2.0.8 `{name, text}` body. The driver must resend it exactly once.
+    let fake = FakeOpencode::start_v2().await;
+    *fake.reject_command_once.lock().unwrap() = true;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("/init the repo"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+
+    let calls = wait_calls(&fake, "POST", "/api/session/ses_test/command", 2).await;
+    assert_eq!(calls[0], json!({ "name": "init", "text": "the repo" }));
+    assert_eq!(calls[1], json!({ "command": "init", "text": "the repo" }));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        fake.calls_to("POST", "/api/session/ses_test/command").len(),
+        2,
+        "the fallback must fire exactly once, never loop"
+    );
+
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+    v2_idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}
+
+#[tokio::test]
+async fn v2_subagent_progress_binds_the_child_and_success_settles_the_chip() {
+    let fake = FakeOpencode::start_v2().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("spawn"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+
+    // 2.0.8 renamed the spawn tool `subagent` (the name rides input.started;
+    // the args arrive on `called`).
+    fake.emit_v2(
+        "session.tool.input.started",
+        json!({ "sessionID": "ses_test", "assistantMessageID": "msg_1", "id": "call_1", "name": "subagent" }),
+    );
+    fake.emit_v2(
+        "session.tool.called",
+        json!({
+            "sessionID": "ses_test", "assistantMessageID": "msg_1", "id": "call_1",
+            "input": { "agent": "explore", "description": "Check the repo", "prompt": "go" },
+            "executed": false,
+        }),
+    );
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(
+        &ev,
+        AgentEvent::ToolCall { id, call: ToolCall::Unknown { name, .. } }
+            if id == "ses_test:msg_1:call_1" && name == "Agent: Check the repo"
+    ));
+
+    // The child session and its late `progress` metadata bind the chip;
+    // child traffic streams tagged with it.
+    fake.emit_v2(
+        "session.created",
+        json!({
+            "sessionID": "ses_child", "parentID": "ses_test",
+            "title": "Check the repo", "agent": "explore",
+        }),
+    );
+    fake.emit_v2(
+        "session.tool.progress",
+        json!({
+            "sessionID": "ses_test", "assistantMessageID": "msg_1", "id": "call_1",
+            "metadata": { "sessionID": "ses_child", "status": "running" },
+        }),
+    );
+    fake.emit_v2(
+        "session.step.started",
+        json!({ "sessionID": "ses_child", "assistantMessageID": "msg_child" }),
+    );
+    fake.emit_v2(
+        "session.text.ended",
+        json!({ "sessionID": "ses_child", "assistantMessageID": "msg_child", "ordinal": 0, "text": "done" }),
+    );
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(
+        &ev,
+        AgentEvent::Subagent { parent_tool_use_id, event }
+            if parent_tool_use_id == "ses_test:msg_1:call_1"
+                && matches!(&**event, AgentEvent::TextDelta { text } if text == "done")
+    ));
+
+    // The terminal `success` folds its content into the chip and settles the
+    // tagged child.
+    fake.emit_v2(
+        "session.tool.success",
+        json!({
+            "sessionID": "ses_test", "assistantMessageID": "msg_1", "id": "call_1",
+            "content": [{ "text": "done" }],
+            "metadata": { "sessionID": "ses_child", "status": "completed", "truncated": false },
+        }),
+    );
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(
+        &ev,
+        AgentEvent::ToolResult { id, is_error: false, output: Some(output), .. }
+            if id == "ses_test:msg_1:call_1" && output == "done"
+    ));
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(
+        &ev,
+        AgentEvent::Subagent { parent_tool_use_id, event }
+            if parent_tool_use_id == "ses_test:msg_1:call_1"
+                && matches!(&**event, AgentEvent::Done { status: DoneStatus::Completed, .. })
+    ));
+
+    v2_idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn v2_subagent_failure_reaches_the_chip_with_its_metadata() {
+    let fake = FakeOpencode::start_v2().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("spawn"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+
+    fake.emit_v2(
+        "session.tool.input.started",
+        json!({ "sessionID": "ses_test", "assistantMessageID": "msg_1", "id": "call_1", "name": "subagent" }),
+    );
+    fake.emit_v2(
+        "session.tool.called",
+        json!({
+            "sessionID": "ses_test", "assistantMessageID": "msg_1", "id": "call_1",
+            "input": { "agent": "broken", "description": "Say hi", "prompt": "say hi" },
+            "executed": false,
+        }),
+    );
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(
+        &ev,
+        AgentEvent::ToolCall { call: ToolCall::Unknown { name, .. }, .. } if name == "Agent: Say hi"
+    ));
+
+    fake.emit_v2(
+        "session.created",
+        json!({ "sessionID": "ses_child", "parentID": "ses_test", "title": "Say hi", "agent": "broken" }),
+    );
+    fake.emit_v2(
+        "session.tool.progress",
+        json!({
+            "sessionID": "ses_test", "assistantMessageID": "msg_1", "id": "call_1",
+            "metadata": { "sessionID": "ses_child", "status": "running" },
+        }),
+    );
+    // The captured failure frame: opencode wraps the child provider error in
+    // its own tool-error message, and the metadata still names the child —
+    // the chip binds on failure too.
+    fake.emit_v2(
+        "session.tool.failed",
+        json!({
+            "sessionID": "ses_test", "assistantMessageID": "msg_1", "id": "call_1",
+            "error": {
+                "type": "tool.execution",
+                "message": "Subagent failed (sessionID: ses_child): capture stub: deliberate 500",
+            },
+            "metadata": { "sessionID": "ses_child", "status": "running" },
+            "executed": false,
+        }),
+    );
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(
+        &ev,
+        AgentEvent::ToolResult { id, is_error: true, output: Some(output), .. }
+            if id == "ses_test:msg_1:call_1" && output.contains("Subagent failed")
+    ));
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(
+        &ev,
+        AgentEvent::Subagent { parent_tool_use_id, event }
+            if parent_tool_use_id == "ses_test:msg_1:call_1"
+                && matches!(&**event, AgentEvent::Done { status: DoneStatus::Errored, .. })
+    ));
+
+    // The parent turn itself was not poisoned by the child's failure.
+    v2_idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn v2_interrupt_uses_the_interrupt_route_and_settles_interrupted() {
+    let fake = FakeOpencode::start_v2().await;
+    let (controls, _steer, token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+
+    token.cancel();
+    wait_calls(&fake, "POST", "/api/session/ses_test/interrupt", 1).await;
+    fake.emit_v2(
+        "session.execution.interrupted",
+        json!({ "sessionID": "ses_test" }),
+    );
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn v2_steer_queues_mid_turn_and_delivers_at_idle() {
+    let fake = FakeOpencode::start_v2().await;
+    let (controls, steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+    fake.emit_v2(
+        "session.text.delta",
+        json!({ "sessionID": "ses_test", "assistantMessageID": "msg_1", "ordinal": 0, "delta": "working" }),
+    );
+    let _ = next_event(&mut stream).await; // TextDelta
+
+    steer
+        .send(SteerMessage {
+            prompt: "also do this".into(),
+            message_id: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    v2_idle(&fake, "ses_test");
+
+    let ev = next_event(&mut stream).await;
+    assert!(
+        matches!(&ev, AgentEvent::Steered { .. }),
+        "queued steer must continue the run at the turn boundary, got {ev:?}"
+    );
+    let prompts = wait_calls(&fake, "POST", "/api/session/ses_test/prompt", 2).await;
+    assert_eq!(prompts[1], json!({ "text": "also do this", "files": [] }));
+
+    v2_assistant_message(&fake, "ses_test", "msg_2");
+    v2_idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn v2_resume_reuses_the_durable_session() {
+    let fake = FakeOpencode::start_v2().await;
+    let (controls, _steer, _token) = controls();
+    let mut req = request("continue");
+    req.resume = Some("ses_resume".into());
+    let mut stream = harness(&fake)
+        .run(req, controls)
+        .await
+        .expect("run starts");
+    let started = next_event(&mut stream).await;
+    assert!(matches!(
+        &started,
+        AgentEvent::SessionStarted { session_id, .. } if session_id == "ses_resume"
+    ));
+    let _ = next_event(&mut stream).await;
+    wait_calls(&fake, "POST", "/api/session/ses_resume/prompt", 1).await;
+
+    v2_assistant_message(&fake, "ses_resume", "msg_1");
+    v2_idle(&fake, "ses_resume");
+    drain_to_done(&mut stream).await;
+}
+
+#[tokio::test]
+async fn v2_permission_reply_sends_the_decision_body() {
+    let fake = FakeOpencode::start_v2().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+
+    fake.emit_v2(
+        "permission.asked",
+        json!({
+            "sessionID": "ses_test", "id": "per_1", "type": "external_directory",
+            "pattern": "/tmp/**", "title": "Access outside the workspace",
+        }),
+    );
+    let reply = wait_calls(
+        &fake,
+        "POST",
+        "/api/session/ses_test/permission/per_1/reply",
+        1,
+    )
+    .await;
+    assert_eq!(reply[0], json!({ "decision": "once" }));
+
+    v2_idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn v2_permission_falls_back_to_the_legacy_body() {
+    // 2.0.0-2.0.3 keyed the reply body `reply` instead of `decision`; a
+    // refusal must resend the legacy body once on the same route.
+    let fake = FakeOpencode::start_v2().await;
+    *fake.reject_permission_once.lock().unwrap() = true;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+
+    fake.emit_v2(
+        "permission.asked",
+        json!({
+            "sessionID": "ses_test", "id": "per_1", "type": "external_directory",
+            "pattern": "/tmp/**", "title": "Access outside the workspace",
+        }),
+    );
+    let calls = wait_calls(
+        &fake,
+        "POST",
+        "/api/session/ses_test/permission/per_1/reply",
+        2,
+    )
+    .await;
+    assert_eq!(calls[0], json!({ "decision": "once" }));
+    assert_eq!(calls[1], json!({ "reply": "once" }));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        fake.calls_to("POST", "/api/session/ses_test/permission/per_1/reply")
+            .len(),
+        2,
+        "the fallback must fire exactly once, never loop"
+    );
+
+    v2_idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}
+
+#[tokio::test]
+async fn v2_forms_flow_through_the_input_bridge_by_field_key() {
+    let fake = FakeOpencode::start_v2().await;
+    let form = json!({
+        "id": "frm_1", "sessionID": "ses_test", "title": "Capture form",
+        "fields": [
+            { "key": "environment", "title": "Environment",
+              "description": "Which environment should this target?",
+              "required": true, "type": "string",
+              "options": [
+                  { "value": "staging", "label": "Staging" },
+                  { "value": "prod", "label": "Production" }] },
+            { "key": "tags", "title": "Tags", "type": "multiselect",
+              "options": [
+                  { "value": "alpha", "label": "Alpha" },
+                  { "value": "beta", "label": "Beta" }] },
+            { "key": "confirm", "title": "Confirm?", "type": "boolean" },
+        ],
+    });
+    fake.set_forms(json!([form.clone()]));
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("ask me"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+
+    // The captured frame nests the whole record under `data.form`; the
+    // pending list is fetched from the session it names.
+    fake.emit_v2("form.created", json!({ "form": form.clone() }));
+    let reply = wait_calls(&fake, "POST", "/api/session/ses_test/form/frm_1/reply", 1).await;
+    assert_eq!(
+        reply[0],
+        json!({ "answer": {
+            "environment": "staging",
+            "tags": ["alpha"],
+            "confirm": true,
+        }})
+    );
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(&ev, AgentEvent::InputResolved { request_id } if request_id == "frm_1"));
+
+    // The server's own `form.replied` echo (flat `{id, sessionID}`) closes
+    // nothing the panel hasn't already released.
+    fake.emit_v2(
+        "form.replied",
+        json!({
+            "id": "frm_1", "sessionID": "ses_test",
+            "answer": { "environment": "staging" },
+        }),
+    );
+    v2_idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::InputResolved { request_id } if request_id == "frm_1")),
+        "the form must close on our panel"
+    );
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn v2_unanswerable_form_is_deleted_and_chipped() {
+    let fake = FakeOpencode::start_v2().await;
+    let form = json!({
+        "id": "frm_2", "sessionID": "ses_test", "title": "Sign in",
+        "fields": [{
+            "key": "login", "type": "external", "title": "Login",
+            "url": "https://example.com/auth",
+        }],
+    });
+    fake.set_forms(json!([form.clone()]));
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("ask me"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+
+    fake.emit_v2("form.created", json!({ "form": form.clone() }));
+    let ev = next_event(&mut stream).await;
+    assert!(
+        matches!(&ev, AgentEvent::Error { message } if message.contains("auth flow")),
+        "an unanswerable form must surface a chip, got {ev:?}"
+    );
+    wait_calls(&fake, "DELETE", "/api/session/ses_test/form/frm_2", 1).await;
+    let ev = next_event(&mut stream).await;
+    assert!(matches!(&ev, AgentEvent::InputResolved { request_id } if request_id == "frm_2"));
+
+    v2_idle(&fake, "ses_test");
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn v2_provider_retries_feed_the_ladder_and_cap_out() {
+    let fake = FakeOpencode::start_v2().await;
+    let (controls, _steer, _token) = controls();
+    let mut stream = harness(&fake)
+        .run(request("hi"), controls)
+        .await
+        .expect("run starts");
+    opening(&mut stream).await;
+    v2_assistant_message(&fake, "ses_test", "msg_1");
+
+    // The captured retry frame carries the provider error verbatim.
+    let retry = |attempt: u64| {
+        json!({
+            "sessionID": "ses_test", "assistantMessageID": "msg_1",
+            "attempt": attempt, "at": 0,
+            "error": {
+                "type": "provider.internal",
+                "message": "capture stub: deliberate 500",
+                "status": 500,
+            },
+        })
+    };
+    fake.emit_v2("session.retry.scheduled", retry(3));
+    let ev = next_event(&mut stream).await;
+    let AgentEvent::Error { message } = &ev else {
+        panic!("expected a retry error chip, got {ev:?}");
+    };
+    assert!(
+        message.contains("retrying") && message.contains("attempt 3"),
+        "{message}"
+    );
+    assert!(message.contains("deliberate 500"), "{message}");
+
+    fake.emit_v2("session.retry.scheduled", retry(8));
+    let ev = next_event(&mut stream).await;
+    let AgentEvent::Error { message } = &ev else {
+        panic!("expected the give-up chip, got {ev:?}");
+    };
+    assert!(message.contains("Giving up"), "{message}");
+    wait_calls(&fake, "POST", "/api/session/ses_test/interrupt", 1).await;
+
+    // The captured terminal failure: error + idle in one frame. The raw
+    // provider message lands in the Done error (the give-up chip above
+    // already carried the retry summary).
+    fake.emit_v2(
+        "session.execution.failed",
+        json!({
+            "sessionID": "ses_test",
+            "error": {
+                "type": "provider.internal",
+                "message": "capture stub: deliberate 500",
+                "status": 500,
+            },
+        }),
+    );
+    let events = drain_to_done(&mut stream).await;
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            error: Some(e),
+            ..
+        }) if e.contains("deliberate 500")
+    ));
+}
+
+#[tokio::test]
+async fn v2_catalog_polls_through_the_empty_warmup() {
+    // models.dev syncs after the health endpoint opens: the server answers
+    // an empty `/api/model` until it lands. The driver must poll instead of
+    // believing the first empty list.
+    let fake = FakeOpencode::start_v2().await;
+    *fake.catalog_empty_left.lock().unwrap() = 2;
+    let models = harness(&fake).models().await.expect("models");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].id, "opencode/test-model");
+}
+

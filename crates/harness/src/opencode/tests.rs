@@ -1484,16 +1484,17 @@ async fn v2_subagent_progress_binds_the_child_to_the_spawn_chip() {
 
 #[tokio::test]
 async fn v2_forms_go_through_the_input_bridge_and_reply_by_field_key() {
-    // `form.created` carries no usable payload (not captured live): the
-    // driver re-reads `/api/session/{id}/form`, answers by field key, and
-    // declines the form whose `external` field the panel cannot drive.
+    // `form.created` nests the record under `data.form` (captured live on
+    // 2.0.10): the driver re-reads `/api/session/{id}/form`, answers by
+    // field key, and declines the form whose `external` field the panel
+    // cannot drive.
     let mut wire = TurnWire::start_policy(false, true, false, Some(true)).await;
     wire.request("/api/model").await;
     wire.request("/prompt").await;
     wire.v2("session.execution.started", json!({"sessionID":"fixture"}));
-    wire.v2("form.created", json!({"sessionID":"fixture","id":"frm_1"}));
-    // A frame without a session id (the payload was not captured live) still
-    // probes the sessions this run owns; the ids dedupe.
+    wire.v2("form.created", json!({"form":{"id":"frm_1","sessionID":"fixture","title":"Ask"}}));
+    // A frame naming no session still probes the sessions this run owns; the
+    // ids dedupe.
     wire.v2("form.created", json!({}));
     let body = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -1718,4 +1719,36 @@ fn v2_forms_project_onto_the_input_panel_and_answer_by_key() {
     // A required field the panel cannot answer (here: left empty) declines
     // the form instead of submitting a partial answer.
     assert!(plan.answer(&[]).is_err());
+}
+
+#[test]
+fn v2_form_frames_unwrap_the_captured_shapes() {
+    let mut tools = HashMap::new();
+    // `form.created` nests the record under `data.form` (captured live on
+    // 2.0.10): the session id must survive so the pending list is fetched
+    // from the right session, and the form id keys the reply route.
+    let out = normalize_v2_frame(
+        json!({"id":"evt_1","type":"form.created","data":{"form":{
+            "id":"frm_1","sessionID":"ses_1","title":"Setup",
+            "fields":[{"key":"mode","type":"string","title":"Mode"}]}}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"form.created","properties":{
+            "sessionID":"ses_1","id":"frm_1"}})]
+    );
+    // `form.replied` / `form.cancelled` carry `{id, sessionID}` flat (same
+    // capture) and close our panel chip.
+    for kind in ["form.replied", "form.cancelled"] {
+        let out = normalize_v2_frame(
+            json!({"id":"evt_2","type":kind,"data":{"id":"frm_1","sessionID":"ses_1"}}),
+            &mut tools,
+        );
+        assert_eq!(
+            out,
+            vec![json!({"type":"form.resolved","properties":{
+                "sessionID":"ses_1","id":"frm_1"}})]
+        );
+    }
 }

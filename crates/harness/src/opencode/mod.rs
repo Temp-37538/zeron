@@ -841,9 +841,10 @@ impl Server {
     }
 
     /// 2.0.8 forms: `GET /api/session/{id}/form` lists the session's pending
-    /// forms (`{data: [Form.Info]}`). The `form.created` frame itself is not
-    /// captured live, so the driver re-reads server state instead of trusting
-    /// the event payload — the list is the authoritative shape.
+    /// forms (`{data: [Form.Info]}`). The driver re-reads this list rather
+    /// than trusting the `form.created` frame — a form may predate our
+    /// subscription, and the list is the authoritative shape (the frame nests
+    /// the same record under `data.form`).
     async fn forms_wire(
         &self,
         session_id: &str,
@@ -2679,10 +2680,11 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             BusOutcome::Continue
         }
         "form.created" => {
-            // 2.0.8 replaced `question.asked` with forms. The frame's own
-            // payload was not captured live, so when it names no session the
-            // driver probes every session this run owns; a named session must
-            // still be ours (same rule as questions).
+            // 2.0.8 replaced `question.asked` with forms. The frame nests the
+            // record under `data.form` (captured live on 2.0.10), so it names
+            // its session; a session we don't own is skipped (same rule as
+            // questions). When it names none, the driver probes every session
+            // this run owns — the fallback stays for shape drift.
             let targets: Vec<String> = match event_session {
                 Some(session)
                     if session == session_id
@@ -3591,7 +3593,8 @@ fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
 /// - 2.0.8 drift: the spawn tool is `subagent` (normalized back to `task`),
 ///   `session.tool.progress` carries the child binding, `session.status` /
 ///   `session.retry.scheduled` feed the retry ladder, and `form.*` replaces
-///   `question.asked` (the form itself is re-read over HTTP).
+///   `question.asked` (`form.created` nests the record under `data.form`;
+///   the driver re-reads the pending list over HTTP).
 ///
 /// `tool_names` tracks pending calls by session, message, and provider call id.
 type V2ToolKey = (String, String, String);
@@ -3600,11 +3603,21 @@ const MAX_PENDING_V2_TOOLS: usize = 4096;
 fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>) -> Vec<Value> {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     let data = event.get("data").cloned().unwrap_or(Value::Null);
-    // 2.0.8 forms: the frame payload was not captured live and the driver
-    // re-reads the pending list over HTTP, so these frames are forwarded
-    // even without a session id (the run loop then probes every session it
-    // owns). Everything else needs one to be routed.
+    // 2.0.8 forms (shapes captured live on 2.0.10): `form.created` nests the
+    // record under `data.form` (`{id, sessionID, title, fields}`);
+    // `form.replied` / `form.cancelled` carry `{id, sessionID}` flat. The
+    // driver re-reads the pending list over HTTP, but the session id still
+    // routes that fetch, so both shapes are unwrapped here. These frames are
+    // forwarded even without a session id (the run loop then probes every
+    // session it owns). Everything else needs one to be routed.
     if matches!(kind, "form.created" | "form.replied" | "form.cancelled") {
+        let form = data.get("form");
+        let pick = |key: &str| {
+            form.and_then(|form| form.get(key))
+                .or_else(|| data.get(key))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
         let event_type = if kind == "form.created" {
             "form.created"
         } else {
@@ -3612,14 +3625,7 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
         };
         return vec![json!({
             "type": event_type,
-            "properties": {
-                "sessionID": data.get("sessionID").cloned().unwrap_or(Value::Null),
-                "id": data
-                    .get("formID")
-                    .or_else(|| data.get("id"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            }
+            "properties": { "sessionID": pick("sessionID"), "id": pick("id") }
         })];
     }
     if data
@@ -3865,8 +3871,8 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
                 }
             }
         })],
-        // 2.0.8 forms are forwarded before the session guard above (their
-        // payload was not captured live); nothing to normalize here.
+        // 2.0.8 forms are unwrapped before the session guard above (their
+        // captured shapes live in the form branch); nothing more to do here.
         "session.created" => {
             let Some(id) = data.get("sessionID").and_then(Value::as_str) else {
                 return Vec::new();
