@@ -1871,36 +1871,22 @@ async fn create_session(server: &Server, dir: Option<&str>) -> Result<String, Ha
     unreachable!("create_session retry loop returns from every path")
 }
 
-/// Provider/model carried by a message info. 1.x put them flat on the
-/// assistant message; the 2.x assistant message (`Session.Message.Assistant`)
-/// nests them under `model` (a `Model.Ref` = `{id, providerID, variant}`).
-fn message_model(info: &Value) -> Option<(String, String)> {
-    let flat = info
-        .get("providerID")
-        .and_then(Value::as_str)
-        .zip(info.get("modelID").and_then(Value::as_str));
-    let nested = info
-        .pointer("/model/providerID")
-        .and_then(Value::as_str)
-        .zip(info.pointer("/model/id").and_then(Value::as_str));
-    flat.or(nested)
-        .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
-}
-
 /// `fallback_window` is the window of the model this run requested. The 2.x
-/// usage frame (`session.usage.updated` → a synthetic assistant message)
-/// carries no provider/model at all, so without it the meter would report
-/// tokens and no denominator, and the UI hides the indicator entirely when
-/// the window is unknown.
+/// step settlement (`session.step.ended`) names no provider/model, so this is
+/// the only denominator the meter can fall back to. Without it the UI would
+/// have tokens and no window, and hide the indicator entirely.
 fn context_usage_event(
     info: &Value,
     context_windows: &HashMap<String, u64>,
     fallback_window: Option<u64>,
 ) -> Option<AgentEvent> {
     let tokens = info.get("tokens")?;
+    // OpenCode's own meter (`session-context-metrics.ts`) sums the latest
+    // assistant message exactly this way, reasoning included.
     let counts: Vec<u64> = [
         tokens.get("input"),
         tokens.get("output"),
+        tokens.get("reasoning"),
         tokens.pointer("/cache/read"),
         tokens.pointer("/cache/write"),
     ]
@@ -1919,7 +1905,10 @@ fn context_usage_event(
     if tokens == Some(0) && info.pointer("/time/completed").is_none() {
         return None;
     }
-    let window = message_model(info)
+    let window = info
+        .get("providerID")
+        .and_then(Value::as_str)
+        .zip(info.get("modelID").and_then(Value::as_str))
         .and_then(|(provider, model)| context_windows.get(&format!("{provider}/{model}")).copied())
         .or(fallback_window);
     (tokens.is_some() || window.is_some()).then_some(AgentEvent::ContextUsage { tokens, window })
@@ -2175,7 +2164,7 @@ struct BusCtx<'a> {
     pending_usage: &'a mut Option<AgentEvent>,
     context_windows: &'a HashMap<String, u64>,
     /// The requested model's context window, used when an event carries no
-    /// provider/model of its own (2.x `session.usage.updated`).
+    /// provider/model of its own (2.x `session.step.ended`).
     run_window: Option<u64>,
 }
 
@@ -2400,7 +2389,12 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 if role == "assistant"
                     && let Some(tokens) = info.get("tokens")
                 {
-                    if let Some(usage) = context_usage_event(info, context_windows, run_window)
+                    // Context occupancy comes from the per-step settlement
+                    // (`session.step.ended`). The cumulative session frame
+                    // only bills: its totals grow for the life of the session
+                    // and would peg the meter at thousands of percent.
+                    if props.get("cumulativeUsage").is_none()
+                        && let Some(usage) = context_usage_event(info, context_windows, run_window)
                         && !send(event_tx, usage).await
                     {
                         return BusOutcome::ConsumerGone;
@@ -3622,7 +3616,9 @@ fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
 /// - tools: `session.tool.input.started` (carries the NAME),
 ///   `.input.ended` (args as text), `.called` (args as object),
 ///   `.success` (content array) / `.error`.
-/// - usage: `session.usage.updated` with the cumulative token totals.
+/// - usage: `session.step.ended` settles the step's own tokens, which is what
+///   the context meter reads; `session.usage.updated` carries lifetime session
+///   totals and is billed only, never metered.
 /// - 2.0.8 drift: the spawn tool is `subagent` (normalized back to `task`),
 ///   `session.tool.progress` carries the child binding, `session.status` /
 ///   `session.retry.scheduled` feed the retry ladder, and `form.*` replaces
@@ -3740,6 +3736,29 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
                 "info": { "sessionID": session(), "id": message(), "role": "assistant" }
             }
         })],
+        // The step's own settlement. This is the numerator the context meter
+        // wants, and it is the only 2.x frame that carries it: the session
+        // row accumulates every step's tokens forever, so
+        // `session.usage.updated` reports a lifetime total instead.
+        "session.step.ended" => {
+            let Some(assistant) = data.get("assistantMessageID").and_then(Value::as_str) else {
+                return Vec::new();
+            };
+            let Some(tokens) = data.get("tokens").filter(|tokens| !tokens.is_null()) else {
+                return Vec::new();
+            };
+            vec![json!({
+                "type": "message.updated",
+                "properties": {
+                    "info": {
+                        "sessionID": session(),
+                        "id": assistant,
+                        "role": "assistant",
+                        "tokens": tokens,
+                    }
+                }
+            })]
+        }
         "session.text.started" | "session.text.ended" => {
             vec![v2_stream_part(
                 &data,
@@ -3862,13 +3881,15 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
             if tokens.is_null() {
                 return Vec::new();
             }
-            // Cumulative totals keyed to a synthetic message: registers
-            // Usage + ContextUsage exactly like the 1.x assistant
-            // message.updated did. (No providerID/modelID on this frame —
-            // the context window is dropped.)
+            // Lifetime session totals keyed to a synthetic message: registers
+            // Usage exactly like the 1.x assistant message.updated did. The
+            // session row adds every step's tokens forever (opencode issue
+            // #30649), so this frame must never feed the context meter; the
+            // marker below is what keeps it out.
             vec![json!({
                 "type": "message.updated",
                 "properties": {
+                    "cumulativeUsage": true,
                     "info": {
                         "sessionID": session(),
                         "id": "usage",
@@ -4131,10 +4152,12 @@ mod context_tests {
         let info = json!({"providerID":"provider","modelID":"model", "tokens": {
             "input": 200, "output": 100, "reasoning": 50, "cache": {"read":40000,"write":1800}
         }});
+        // Reasoning counts: opencode's own meter adds it (`session-context-
+        // metrics.ts`), so the total is 200 + 100 + 50 + 40000 + 1800.
         assert_eq!(
             context_usage_event(&info, &windows, None),
             Some(AgentEvent::ContextUsage {
-                tokens: Some(42100),
+                tokens: Some(42150),
                 window: Some(200000)
             })
         );
@@ -4156,31 +4179,13 @@ mod context_tests {
     }
 
     #[test]
-    fn context_window_resolves_from_the_2x_nested_model_ref() {
-        // `Session.Message.Assistant` carries `model: Model.Ref`, not flat
-        // providerID/modelID.
-        let windows = HashMap::from([("provider/model".into(), 200000)]);
-        let info = json!({
-            "model": {"id": "model", "providerID": "provider"},
-            "tokens": {"input": 10, "output": 5, "cache": {"read": 0, "write": 0}}
-        });
-        assert_eq!(
-            context_usage_event(&info, &windows, None),
-            Some(AgentEvent::ContextUsage {
-                tokens: Some(15),
-                window: Some(200000)
-            })
-        );
-    }
-
-    #[test]
-    fn usage_frame_without_a_model_falls_back_to_the_run_window() {
-        // `session.usage.updated` normalizes to a synthetic assistant message
-        // that names no provider/model, so the requested model is the only
-        // denominator left. Without it the UI hides the indicator outright.
+    fn step_settlement_without_a_model_falls_back_to_the_run_window() {
+        // `session.step.ended` names no provider/model, so the requested model
+        // is the only denominator left. Without it the UI hides the indicator
+        // outright.
         let windows = HashMap::from([("provider/model".into(), 200000)]);
         let info =
-            json!({"id": "usage", "role": "assistant", "tokens": {"input": 200, "output": 100}});
+            json!({"id": "msg_a", "role": "assistant", "tokens": {"input": 200, "output": 100}});
         assert_eq!(
             context_usage_event(&info, &windows, Some(200000)),
             Some(AgentEvent::ContextUsage {

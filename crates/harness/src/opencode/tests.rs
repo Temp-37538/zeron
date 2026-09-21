@@ -308,13 +308,23 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
         }),
     );
     wire.v2(
+        "session.step.ended",
+        json!({
+            "sessionID": "fixture", "assistantMessageID": "msg_a",
+            "finish": "stop", "cost": 0,
+            "tokens": {"input": 10, "output": 2, "reasoning": 0,
+                       "cache": {"read": 900, "write": 100}}
+        }),
+    );
+    wire.v2(
         "session.execution.succeeded",
         json!({"sessionID": "fixture"}),
     );
 
-    let (status, text, usage) = tokio::time::timeout(Duration::from_secs(5), async {
+    let (status, text, usage, context) = tokio::time::timeout(Duration::from_secs(5), async {
         let mut text = String::new();
         let mut usage = None;
+        let mut context = None;
         loop {
             match wire.events.recv().await.unwrap().unwrap() {
                 AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
@@ -324,7 +334,8 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
                 } => {
                     usage = Some((input_tokens, output_tokens));
                 }
-                AgentEvent::Done { status, .. } => return (status, text, usage),
+                AgentEvent::ContextUsage { tokens, window } => context = Some((tokens, window)),
+                AgentEvent::Done { status, .. } => return (status, text, usage, context),
                 _ => {}
             }
         }
@@ -334,6 +345,9 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
     assert_eq!(status, DoneStatus::Completed);
     assert_eq!(text, "PONG");
     assert_eq!(usage, Some((10, 2)));
+    // The step settlement is the meter's numerator: 10 + 2 + 0 + 900 + 100.
+    // The cumulative session frame carries 10 + 2 and must not win.
+    assert_eq!(context.map(|(tokens, _)| tokens), Some(Some(1012)));
 }
 
 #[tokio::test]
@@ -1047,7 +1061,9 @@ fn v2_frames_normalize_to_v1_payloads() {
             "type":"tool","tool":"read",
             "state":{"status":"running","input":{"path":"/tmp/x"}}}}})]
     );
-    // Usage totals reach the engine as an assistant message.updated.
+    // Usage totals reach the engine as an assistant message.updated. The
+    // frame is a lifetime session total, so it is marked as billing-only and
+    // the context meter skips it.
     let out = normalize_v2_frame(
         json!({"id":"evt_9","type":"session.usage.updated","data":{
             "sessionID":"ses_1","cost":0,
@@ -1057,9 +1073,25 @@ fn v2_frames_normalize_to_v1_payloads() {
     assert_eq!(
         out,
         vec![json!({"type":"message.updated","properties":{
+            "cumulativeUsage":true,
             "info":{"sessionID":"ses_1","id":"usage","role":"assistant",
                     "tokens":{"input":10,"output":2,"reasoning":0,
                               "cache":{"read":0,"write":0}}}}})]
+    );
+    // The step settlement is the context meter's numerator: the step's own
+    // tokens, keyed to the assistant message the step streamed under.
+    let out = normalize_v2_frame(
+        json!({"id":"evt_10","type":"session.step.ended","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","finish":"stop","cost":0,
+            "tokens":{"input":700,"output":12,"reasoning":3,"cache":{"read":64000,"write":900}}}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"message.updated","properties":{
+            "info":{"sessionID":"ses_1","id":"msg_a","role":"assistant",
+                    "tokens":{"input":700,"output":12,"reasoning":3,
+                              "cache":{"read":64000,"write":900}}}}})]
     );
     // The permission ask keeps its 1.x name on 2.x (observed live when a
     // tool reaches outside the workspace); the auto-approver replies.
