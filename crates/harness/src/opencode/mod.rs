@@ -2972,16 +2972,11 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
             let (reply_path, fallback_path) = match protocol {
                 Protocol::V1 => (
                     format!("/permission/{id}/reply"),
-                    "reply",
-                    Some((format!("/session/{session}/permissions/{id}"), "response")),
+                    Some(format!("/session/{session}/permissions/{id}")),
                 ),
                 Protocol::V2 => (
                     format!("/api/session/{session}/permission/{id}/reply"),
-                    "decision",
-                    Some((
-                        format!("/api/session/{session}/permission/{id}/reply"),
-                        "reply",
-                    )),
+                    None,
                 ),
             };
             let base = server.base.clone();

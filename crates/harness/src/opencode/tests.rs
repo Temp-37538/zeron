@@ -137,15 +137,8 @@ impl TurnWire {
                         }
                     };
                     let header = String::from_utf8_lossy(&request[..header_end]);
-                    let method = header
-                        .lines()
-                        .next()
-                        .unwrap()
-                        .split_whitespace()
-                        .next()
-                        .unwrap()
-                        .to_owned();
                     let path = header.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_owned();
+                    let is_post = header.starts_with("POST ");
                     let length = header.lines().find_map(|line| {
                         let (name, value) = line.split_once(':')?;
                         name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
@@ -155,7 +148,7 @@ impl TurnWire {
                         if n == 0 { return; }
                         request.extend_from_slice(&buf[..n]);
                     }
-                    if method == "POST" || method == "DELETE" { recorded.lock().unwrap().push((path.clone(), serde_json::from_slice(&request[header_end..header_end+length]).unwrap_or(Value::Null))); }
+                    if is_post { recorded.lock().unwrap().push((path.clone(), serde_json::from_slice(&request[header_end..header_end+length]).unwrap_or(Value::Null))); }
                     if path == "/global/event" || path == "/api/event" {
                         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: connected\n\n").await.unwrap();
                         let mut events = bus_rx.lock().await.take().unwrap();
