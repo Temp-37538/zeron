@@ -8228,6 +8228,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "serial"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9896,6 +9909,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"
@@ -11724,7 +11743,7 @@ dependencies = [
 
 [[package]]
 name = "zeron"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "clap",
@@ -11738,6 +11757,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-sys 0.61.2",
  "zeron-engine",
+ "zeron-mcp",
  "zeron-rpc",
  "zeron-ui",
  "zeron-update",
@@ -11745,7 +11765,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-doc"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "chrono",
  "loro",
@@ -11759,7 +11779,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-engine"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11793,11 +11813,12 @@ dependencies = [
  "zeron-rpc",
  "zeron-sync",
  "zeron-update",
+ "zip",
 ]
 
 [[package]]
 name = "zeron-harness"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11806,8 +11827,10 @@ dependencies = [
  "futures",
  "libc",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
@@ -11821,8 +11844,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeron-mcp"
+version = "0.2.83"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zeron-doc",
+ "zeron-proto",
+ "zeron-rpc",
+]
+
+[[package]]
 name = "zeron-preview"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11850,9 +11891,10 @@ dependencies = [
 
 [[package]]
 name = "zeron-proto"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "chrono",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "uuid",
@@ -11860,7 +11902,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-rpc"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -11879,7 +11921,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-sync"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "block2 0.6.2",
  "chrono",
@@ -11902,7 +11944,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-syntax"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "thiserror 2.0.20",
  "tree-sitter",
@@ -11936,7 +11978,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-theme"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "clap",
@@ -11951,7 +11993,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-ui"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -12017,7 +12059,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-update"
-version = "0.2.79"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "futures",

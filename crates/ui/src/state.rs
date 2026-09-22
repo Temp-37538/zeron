@@ -1555,9 +1555,14 @@ impl AppState {
 
     // ---- queries ----
 
-    /// Non-archived chats in sidebar order.
+    /// Non-archived, top-level chats in sidebar order. Chats spawned by
+    /// another chat (`parent_chat_id`, the Zeron MCP's orchestration link)
+    /// are the parent's workers, not sessions the user started: they stay
+    /// reachable by id/deep link but never take a sidebar row or jump slot.
     pub fn visible_chats(&self) -> impl Iterator<Item = &Chat> {
-        self.chats.iter().filter(|c| !c.archived)
+        self.chats
+            .iter()
+            .filter(|c| !c.archived && c.parent_chat_id.is_none())
     }
 
     pub(crate) fn restore_composer_target(
@@ -3298,6 +3303,7 @@ mod tests {
             created_at: base + TimeDelta::minutes(created_min),
             harness_session_id: None,
             harness_session_cwd: None,
+            parent_chat_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -3345,6 +3351,7 @@ mod tests {
             device_id: "dev".into(),
             status: None,
             continuation_of: None,
+            duration_ms: None,
         }
     }
 
@@ -4136,6 +4143,26 @@ mod tests {
     }
 
     #[test]
+    fn visible_chats_hide_spawned_children() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        let mut child = chat("child", 0, Some(1));
+        child.parent_chat_id = Some("parent".into());
+        state.apply_chats(vec![child, chat("parent", 1, Some(2))]);
+        let visible: Vec<&str> = state.visible_chats().map(|c| c.id.as_str()).collect();
+        assert_eq!(visible, ["parent"]);
+        // The sidebar list and jump slots follow the same rule.
+        let rows: Vec<&str> = state
+            .sidebar_chats(now, None)
+            .into_iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(rows, ["parent"]);
+        // The child row itself is still addressable (deep links, tabs).
+        assert!(state.chats.iter().any(|c| c.id == "child"));
+    }
+
+    #[test]
     fn jump_slots_count_the_rows_the_sidebar_draws() {
         let now = Utc::now();
         let mut state = AppState::new();
@@ -4198,6 +4225,7 @@ mod tests {
             device_id: "local".into(),
             status: None,
             continuation_of: None,
+            duration_ms: None,
         };
         state.push_echo("c1", echo.clone());
         // Duplicate pushes dedupe.

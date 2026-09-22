@@ -49,12 +49,11 @@ struct FakeOpencode {
     /// non-empty (the real server serves an empty list while models.dev
     /// syncs and the driver must poll through it).
     catalog_empty_left: Arc<Mutex<u32>>,
-    /// Answer the next 2.x `POST .../command` with 400 so the legacy body
-    /// fallback fires (2.0.0-2.0.3 spoke `{command, text}`).
-    reject_command_once: Arc<Mutex<bool>>,
-    /// Answer the next 2.x permission reply with 400 so the `{reply}` legacy
-    /// fallback fires (2.0.0-2.0.3 keyed the old body `reply`).
-    reject_permission_once: Arc<Mutex<bool>>,
+    /// Latest `session.status` per session, so the status-poll route can
+    /// answer an ambiguous idle.
+    statuses: Arc<Mutex<serde_json::Map<String, Value>>>,
+    /// Commands served on the 1.x `/command` route.
+    commands: Arc<Mutex<Value>>,
     /// Whether the fake speaks the 2.x `/api/*` wire.
     v2: bool,
     /// Whether an SSE subscriber existed when the FIRST prompt landed (the
@@ -64,11 +63,6 @@ struct FakeOpencode {
     /// Leading 500s to answer `POST /session` with (the opencode
     /// lazy-migration crash class: first access 500s, retry succeeds).
     fail_session_creates: Arc<Mutex<u32>>,
-}
-
-/// Consume a one-shot rejection flag.
-fn take_once(flag: &Mutex<bool>) -> bool {
-    std::mem::replace(&mut *flag.lock().unwrap(), false)
 }
 
 impl FakeOpencode {
@@ -98,8 +92,10 @@ impl FakeOpencode {
             forms: Arc::new(Mutex::new(json!([]))),
             sse_accept: Arc::new(Mutex::new(None)),
             catalog_empty_left: Arc::new(Mutex::new(0)),
-            reject_command_once: Arc::new(Mutex::new(false)),
-            reject_permission_once: Arc::new(Mutex::new(false)),
+            statuses: Arc::default(),
+            commands: Arc::new(Mutex::new(
+                json!([{ "name": "init", "description": "Create AGENTS.md" }]),
+            )),
             v2,
             first_prompt_had_subscriber: Arc::new(Mutex::new(None)),
             fail_session_creates: Arc::new(Mutex::new(0)),
@@ -125,8 +121,17 @@ impl FakeOpencode {
     }
 
     /// Push one 1.x bus event (the driver accepts both the bare and the
-    /// `/global/event` envelope; the fake uses the enveloped form).
+    /// `/global/event` envelope; the fake uses the enveloped form). Status
+    /// frames are also recorded so the status-poll route can answer them.
     fn emit(&self, payload: Value) {
+        if payload["type"] == "session.status"
+            && let Some(id) = payload["properties"]["sessionID"].as_str()
+        {
+            self.statuses
+                .lock()
+                .unwrap()
+                .insert(id.to_owned(), payload["properties"]["status"].clone());
+        }
         let framed = format!(
             "data: {}\n\n",
             json!({ "directory": "/", "payload": payload })
@@ -312,10 +317,7 @@ impl FakeOpencode {
         match (method, path) {
             ("GET", "/global/health") => ("200 OK", json!({ "healthy": true })),
             ("GET", "/provider") => ("200 OK", self.providers.lock().unwrap().clone()),
-            ("GET", "/command") => (
-                "200 OK",
-                json!([{ "name": "init", "description": "Create AGENTS.md" }]),
-            ),
+            ("GET", "/command") => ("200 OK", self.commands.lock().unwrap().clone()),
             ("POST", "/session") => {
                 let mut fails = self.fail_session_creates.lock().unwrap();
                 if *fails > 0 {
@@ -334,6 +336,10 @@ impl FakeOpencode {
                     ("200 OK", json!({ "id": "ses_test" }))
                 }
             }
+            ("GET", "/session/status") => (
+                "200 OK",
+                Value::Object(self.statuses.lock().unwrap().clone()),
+            ),
             ("GET", "/session/ses_resume") => ("200 OK", json!({ "id": "ses_resume" })),
             ("GET", p) if p.starts_with("/session/") => ("404 Not Found", json!({})),
             ("POST", p) if p.ends_with("/prompt_async") => ("204 No Content", json!({})),
@@ -397,18 +403,8 @@ impl FakeOpencode {
             ("POST", p) if p.ends_with("/interrupt") => {
                 ("200 OK", json!({ "interrupted": true }))
             }
-            ("POST", p) if p.ends_with("/command") => {
-                if take_once(&self.reject_command_once) {
-                    return ("400 Bad Request", json!({ "error": "unknown field `name`" }));
-                }
-                ("200 OK", json!({ "data": {} }))
-            }
-            ("POST", p) if p.contains("/permission/") => {
-                if take_once(&self.reject_permission_once) {
-                    return ("400 Bad Request", json!({ "error": "unknown field `decision`" }));
-                }
-                ("200 OK", json!({ "data": {} }))
-            }
+            ("POST", p) if p.ends_with("/command") => ("200 OK", json!({ "data": {} })),
+            ("POST", p) if p.contains("/permission/") => ("200 OK", json!({ "data": {} })),
             // Answering or cancelling settles the pending form server-side.
             ("POST", p) if p.contains("/form/") && p.ends_with("/reply") => {
                 *self.forms.lock().unwrap() = json!([]);
@@ -1157,13 +1153,14 @@ async fn models_discover_from_the_provider_catalog() {
     let models = harness.models().await.expect("models");
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, "opencode/big-pickle");
+    assert!(models[0].options.is_empty(), "v1 must not advertise agents");
     // Commands were primed off the same probe.
     let commands = harness.commands().await.expect("commands");
     assert_eq!(commands[0].name, "init");
 }
 
 #[tokio::test]
-async fn models_refresh_large_provider_catalogs_and_recover_after_disconnect() {
+async fn models_keep_large_catalog_on_empty_response_and_recover() {
     let fake = FakeOpencode::start().await;
     let harness = harness(&fake);
     let models: serde_json::Map<String, Value> = (0..512)
@@ -1177,9 +1174,14 @@ async fn models_refresh_large_provider_catalogs_and_recover_after_disconnect() {
     assert_eq!(harness.models().await.unwrap().len(), 512);
 
     fake.set_providers(json!({"all": [], "connected": []}));
+    // An empty response without a credential-context change is a failed probe,
+    // so the last successful catalog remains available.
+    let retained = harness.models().await.unwrap();
+    assert_eq!(retained.len(), 512);
     assert!(
-        harness.models().await.is_err(),
-        "must not return the old account's catalog"
+        retained
+            .iter()
+            .all(|model| model.id.starts_with("provider/"))
     );
 
     fake.set_providers(json!({
@@ -1331,34 +1333,6 @@ async fn v2_slash_command_sends_name_and_text() {
             ..
         })
     ));
-}
-
-#[tokio::test]
-async fn v2_command_falls_back_to_the_legacy_body() {
-    // 2.0.0-2.0.3 spoke `{command, text}` on the same route and 400s the
-    // 2.0.8 `{name, text}` body. The driver must resend it exactly once.
-    let fake = FakeOpencode::start_v2().await;
-    *fake.reject_command_once.lock().unwrap() = true;
-    let (controls, _steer, _token) = controls();
-    let mut stream = harness(&fake)
-        .run(request("/init the repo"), controls)
-        .await
-        .expect("run starts");
-    opening(&mut stream).await;
-
-    let calls = wait_calls(&fake, "POST", "/api/session/ses_test/command", 2).await;
-    assert_eq!(calls[0], json!({ "name": "init", "text": "the repo" }));
-    assert_eq!(calls[1], json!({ "command": "init", "text": "the repo" }));
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(
-        fake.calls_to("POST", "/api/session/ses_test/command").len(),
-        2,
-        "the fallback must fire exactly once, never loop"
-    );
-
-    v2_assistant_message(&fake, "ses_test", "msg_1");
-    v2_idle(&fake, "ses_test");
-    drain_to_done(&mut stream).await;
 }
 
 #[tokio::test]
@@ -1677,48 +1651,6 @@ async fn v2_permission_reply_sends_the_decision_body() {
 }
 
 #[tokio::test]
-async fn v2_permission_falls_back_to_the_legacy_body() {
-    // 2.0.0-2.0.3 keyed the reply body `reply` instead of `decision`; a
-    // refusal must resend the legacy body once on the same route.
-    let fake = FakeOpencode::start_v2().await;
-    *fake.reject_permission_once.lock().unwrap() = true;
-    let (controls, _steer, _token) = controls();
-    let mut stream = harness(&fake)
-        .run(request("hi"), controls)
-        .await
-        .expect("run starts");
-    opening(&mut stream).await;
-    v2_assistant_message(&fake, "ses_test", "msg_1");
-
-    fake.emit_v2(
-        "permission.asked",
-        json!({
-            "sessionID": "ses_test", "id": "per_1", "type": "external_directory",
-            "pattern": "/tmp/**", "title": "Access outside the workspace",
-        }),
-    );
-    let calls = wait_calls(
-        &fake,
-        "POST",
-        "/api/session/ses_test/permission/per_1/reply",
-        2,
-    )
-    .await;
-    assert_eq!(calls[0], json!({ "decision": "once" }));
-    assert_eq!(calls[1], json!({ "reply": "once" }));
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    assert_eq!(
-        fake.calls_to("POST", "/api/session/ses_test/permission/per_1/reply")
-            .len(),
-        2,
-        "the fallback must fire exactly once, never loop"
-    );
-
-    v2_idle(&fake, "ses_test");
-    drain_to_done(&mut stream).await;
-}
-
-#[tokio::test]
 async fn v2_forms_flow_through_the_input_bridge_by_field_key() {
     let fake = FakeOpencode::start_v2().await;
     let form = json!({
@@ -1906,3 +1838,60 @@ async fn v2_catalog_polls_through_the_empty_warmup() {
     assert_eq!(models[0].id, "opencode/test-model");
 }
 
+#[tokio::test]
+async fn slash_command_rejects_attachments_instead_of_dropping_them() {
+    let fake = FakeOpencode::start().await;
+    let (controls, _steer, _token) = controls();
+    let mut req = request("/init the repo");
+    req.attachments.push("/tmp/image.png".into());
+    let mut stream = harness(&fake).run(req, controls).await.unwrap();
+    let events = drain_to_done(&mut stream).await;
+    assert!(events.iter().any(|event| matches!(event,
+        AgentEvent::Done { status: DoneStatus::Errored, error: Some(message), .. }
+        if message.contains("attachments")
+    )));
+    assert!(fake.posts_to("/session/ses_test/command").is_empty());
+    assert!(fake.posts_to("/session/ses_test/prompt_async").is_empty());
+}
+
+#[tokio::test]
+async fn dollar_selected_skill_uses_opencode_native_command_with_arguments() {
+    use zeron_proto::{
+        HarnessId,
+        invocation::{Invocation, harness_prompt},
+    };
+    let fake = FakeOpencode::start().await;
+    *fake.commands.lock().unwrap() = json!([
+        {"name":"review","description":"Native skill","source":"skill"},
+        {"name":"init","source":"command"}
+    ]);
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cwd.path().join(".git")).unwrap();
+    let h = harness(&fake);
+    let skills = h.skills(cwd.path()).await.unwrap().unwrap();
+    let skill = skills
+        .into_iter()
+        .find(|skill| skill.name == "review")
+        .unwrap();
+    let invocation = Invocation::Skill {
+        name: skill.name,
+        path: skill.path,
+        command: skill.command,
+    };
+    let prompt = harness_prompt(
+        &format!("\n  {} inspect tests", invocation.link()),
+        HarnessId::Opencode,
+    );
+    assert_eq!(prompt, "\n  /review inspect tests");
+    let (controls, _steer, _) = controls();
+    let mut stream = h.run(request(&prompt), controls).await.unwrap();
+    let _ = next_event(&mut stream).await;
+    let _ = next_event(&mut stream).await;
+    let commands = wait_posts(&fake, "/session/ses_test/command", 1).await;
+    assert_eq!(commands[0]["command"], "review");
+    assert_eq!(commands[0]["arguments"], "inspect tests");
+    assert!(fake.posts_to("/session/ses_test/prompt_async").is_empty());
+    assistant_message(&fake, "ses_test", "msg_1");
+    idle(&fake, "ses_test");
+    drain_to_done(&mut stream).await;
+}

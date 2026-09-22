@@ -426,6 +426,24 @@ pub fn code_fences_generation(cx: &App) -> u64 {
         .unwrap_or_default()
 }
 
+/// Compact transcript mode: each turn's work folds into one collapsed
+/// accordion, leaving only the reply text. Transcripts poll this during
+/// render and rebuild their row split on a flip — cheap by design (a bool
+/// field read, not a `current()` clone).
+pub fn transcript_compact_mode(cx: &App) -> bool {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.current.transcript_compact_mode)
+        .unwrap_or_default()
+}
+
+pub fn set_transcript_compact_mode(enabled: bool, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.transcript_compact_mode = enabled;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
 pub fn update(policy: SavePolicy, cx: &mut App, mutate: impl FnOnce(&mut UiSettings)) -> bool {
     if !cx.has_global::<SettingsStore>() {
         return false;
@@ -607,6 +625,36 @@ impl WindowGeometry {
     }
 }
 
+/// Trigger preferences belong to each harness, not the currently selected model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillCompletionSettings {
+    pub dollar: bool,
+    pub separate_from_slash: bool,
+}
+
+impl SkillCompletionSettings {
+    pub fn for_harness(harness: zeron_proto::HarnessId) -> Self {
+        let native_dollar = harness == zeron_proto::HarnessId::Codex;
+        Self {
+            dollar: native_dollar,
+            separate_from_slash: native_dollar,
+        }
+    }
+}
+
+pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 9] = [
+    (zeron_proto::HarnessId::Antigravity, "Antigravity"),
+    (zeron_proto::HarnessId::ClaudeCode, "Claude Code"),
+    (zeron_proto::HarnessId::Codex, "Codex"),
+    (zeron_proto::HarnessId::Cursor, "Cursor"),
+    (zeron_proto::HarnessId::Devin, "Devin"),
+    (zeron_proto::HarnessId::Grok, "Grok"),
+    (zeron_proto::HarnessId::Hermes, "Hermes"),
+    (zeron_proto::HarnessId::Pi, "Pi"),
+    (zeron_proto::HarnessId::Opencode, "OpenCode"),
+];
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -614,6 +662,10 @@ pub struct UiSettings {
     pub window_geometry: Option<WindowGeometry>,
     /// Submit using Enter or the platform modifier plus Enter.
     pub composer_send_behavior: ComposerSendBehavior,
+    /// Legacy global opt-in; per-harness preferences take precedence.
+    pub skills_in_slash_menu: bool,
+    pub skill_completion_by_harness:
+        std::collections::HashMap<zeron_proto::HarnessId, SkillCompletionSettings>,
     pub sidebar_width: f32,
     pub sidebar_collapsed: bool,
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
@@ -648,6 +700,9 @@ pub struct UiSettings {
     /// Sidebar session filter: a space id, or `None` for "All spaces".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_filter: Option<String>,
+    /// Custom sidebar organization, isolated between account profiles on this device.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sidebar_sections_by_profile: HashMap<String, Vec<SidebarSection>>,
     /// Device-local pins for local profiles; synced profiles use registry pins.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sidebar_pinned_session_ids_by_profile: HashMap<String, Vec<String>>,
@@ -729,11 +784,16 @@ pub struct UiSettings {
     /// Agent-sent Markdown fences: wrap long lines to the chat width instead
     /// of exposing their horizontal scroll plane.
     pub code_fences_fit_content: bool,
-    /// Maximum conversation width in logical pixels; composer width is independent.
+    /// Maximum message and docked composer surface width in logical pixels.
+    /// The centered new-chat composer keeps its own width.
     pub transcript_width: f32,
     /// Open a normal web-link activation in the session Browser. Explicit
     /// context-menu actions remain available regardless of this preference.
     pub open_web_links_in_zeron: bool,
+    /// Compact transcript: a turn's working steps (thinking, tool calls, and
+    /// the narration between them) fold into one collapsed accordion, so only
+    /// the reply text stays visible.
+    pub transcript_compact_mode: bool,
     /// Save edited workspace files automatically after the configured delay.
     pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
@@ -777,6 +837,7 @@ impl Default for UiSettings {
             open_tabs: None,
             space_filter: None,
             sidebar_pinned_session_ids_by_profile: HashMap::new(),
+            sidebar_sections_by_profile: HashMap::new(),
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             sound_enabled: true,
@@ -794,6 +855,8 @@ impl Default for UiSettings {
             escape_stops_active_agent: false,
             cycle_sessions_recently_used: false,
             composer_send_behavior: ComposerSendBehavior::default(),
+            skills_in_slash_menu: false,
+            skill_completion_by_harness: Default::default(),
             appshots_enabled: false,
             appshot_sound_enabled: true,
             appshot_destination: crate::appshots::AppshotDestination::Automatic,
@@ -814,6 +877,7 @@ impl Default for UiSettings {
             code_fences_fit_content: false,
             transcript_width: TRANSCRIPT_WIDTH_DEFAULT,
             open_web_links_in_zeron: true,
+            transcript_compact_mode: false,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
@@ -861,6 +925,7 @@ pub enum ShortcutId {
     BrowserReload,
     ToggleSidebar,
     ToggleChanges,
+    ToggleFiles,
     ToggleTerminal,
     NewSession,
     NewProject,
@@ -872,12 +937,13 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 12 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 13 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
+        ShortcutId::ToggleFiles,
         ShortcutId::ToggleTerminal,
         ShortcutId::NewSession,
         ShortcutId::NewProject,
@@ -908,6 +974,7 @@ impl ShortcutId {
             ShortcutId::BrowserReload => "Reload browser page",
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
+            ShortcutId::ToggleFiles => "Toggle files panel",
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::NewSession => "New session",
             ShortcutId::NewProject => "New project",
@@ -934,6 +1001,7 @@ impl ShortcutId {
             ShortcutId::BrowserReload => "mod-shift-r",
             ShortcutId::ToggleSidebar => "mod-b",
             ShortcutId::ToggleChanges => "mod-r",
+            ShortcutId::ToggleFiles => "mod-e",
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::NewSession => "mod-n",
             ShortcutId::NewProject => "mod-shift-n",
@@ -980,6 +1048,7 @@ pub struct KeymapConfig {
     pub browser_reload: String,
     pub toggle_sidebar: String,
     pub toggle_changes: String,
+    pub toggle_files: String,
     pub toggle_terminal: String,
     pub new_session: String,
     pub new_project: String,
@@ -1043,6 +1112,7 @@ impl Default for KeymapConfig {
             browser_reload: ShortcutId::BrowserReload.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
+            toggle_files: ShortcutId::ToggleFiles.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
             new_project: ShortcutId::NewProject.default_combo().into(),
@@ -1063,6 +1133,7 @@ impl KeymapConfig {
             ShortcutId::BrowserReload => &self.browser_reload,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
+            ShortcutId::ToggleFiles => &self.toggle_files,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
             ShortcutId::NewSession => &self.new_session,
             ShortcutId::NewProject => &self.new_project,
@@ -1085,6 +1156,7 @@ impl KeymapConfig {
             ShortcutId::BrowserReload => self.browser_reload = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
+            ShortcutId::ToggleFiles => self.toggle_files = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
             ShortcutId::NewSession => self.new_session = combo,
             ShortcutId::NewProject => self.new_project = combo,
@@ -1320,6 +1392,19 @@ impl UiSettings {
             .or_default()
     }
 
+    pub fn skill_completion(&self, harness: zeron_proto::HarnessId) -> SkillCompletionSettings {
+        self.skill_completion_by_harness
+            .get(&harness)
+            .copied()
+            .unwrap_or_else(|| {
+                let mut settings = SkillCompletionSettings::for_harness(harness);
+                if self.skills_in_slash_menu {
+                    settings.separate_from_slash = false;
+                }
+                settings
+            })
+    }
+
     /// Whether this session event may produce audio. Appshot capture has its
     /// own feature-local preference once the Appshots contribution lands.
     pub fn session_sound_enabled(&self, sound: crate::sound::Sound) -> bool {
@@ -1452,6 +1537,27 @@ impl UiSettings {
                             keymap.insert(field.into(), serde_json::json!(combo));
                         }
                     }
+                    // A shortcut added after the file was written takes its
+                    // default only when that combo is free: a user who had
+                    // already bound the same chord elsewhere keeps their
+                    // binding and the new row arrives unbound.
+                    if let Some(keymap) = value
+                        .get_mut("keymap")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        for (id, field) in [(ShortcutId::ToggleFiles, "toggleFiles")] {
+                            let default = platform_combo(id.default_combo());
+                            let taken = !keymap.contains_key(field)
+                                && keymap.values().any(|existing| {
+                                    existing
+                                        .as_str()
+                                        .is_some_and(|combo| platform_combo(combo) == default)
+                                });
+                            if taken {
+                                keymap.insert(field.into(), serde_json::json!(""));
+                            }
+                        }
+                    }
                     serde_json::from_value::<UiSettings>(value)
                 }) {
                     Ok(settings) => settings.migrated().clamped(),
@@ -1507,9 +1613,63 @@ fn min_or(value: f32, min: f32, default: f32) -> f32 {
     }
 }
 
+pub use zeron_proto::SidebarSection;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skill_completion_defaults_overrides_and_persistence_are_per_harness() {
+        use zeron_proto::HarnessId;
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = UiSettings::default();
+        for (harness, _) in SKILL_COMPLETION_HARNESSES {
+            let preferences = settings.skill_completion(harness);
+            assert_eq!(preferences.dollar, harness == HarnessId::Codex);
+            assert_eq!(preferences.separate_from_slash, harness == HarnessId::Codex);
+        }
+        settings.skill_completion_by_harness.insert(
+            HarnessId::ClaudeCode,
+            SkillCompletionSettings {
+                dollar: true,
+                separate_from_slash: true,
+            },
+        );
+        settings.skill_completion_by_harness.insert(
+            HarnessId::Opencode,
+            SkillCompletionSettings {
+                dollar: true,
+                separate_from_slash: false,
+            },
+        );
+        settings.save(dir.path()).unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            settings.skill_completion_by_harness,
+            loaded.skill_completion_by_harness
+        );
+        assert!(loaded.skill_completion(HarnessId::ClaudeCode).dollar);
+        assert!(!loaded.skill_completion(HarnessId::Cursor).dollar);
+        let legacy: UiSettings = serde_json::from_str(r#"{"skillsInSlashMenu":true}"#).unwrap();
+        assert!(
+            !legacy
+                .skill_completion(HarnessId::Codex)
+                .separate_from_slash
+        );
+        assert!(legacy.skill_completion(HarnessId::Codex).dollar);
+    }
+
+    #[test]
+    fn slash_skills_are_opt_in_and_persist() {
+        let old: UiSettings = serde_json::from_str("{}").unwrap();
+        assert!(!old.skills_in_slash_menu);
+        let dir = tempfile::tempdir().unwrap();
+        let mut settings = old;
+        settings.skills_in_slash_menu = true;
+        settings.save(dir.path()).unwrap();
+        assert!(UiSettings::load(dir.path()).skills_in_slash_menu);
+    }
 
     #[test]
     fn composer_send_behavior_is_opt_in_for_old_and_partial_settings() {
@@ -2006,6 +2166,7 @@ mod tests {
             )]),
             open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
             space_filter: Some("space-1".into()),
+            sidebar_sections_by_profile: HashMap::new(),
             sidebar_pinned_session_ids_by_profile: HashMap::from([
                 (
                     "local".to_string(),
@@ -2039,6 +2200,8 @@ mod tests {
             escape_stops_active_agent: true,
             cycle_sessions_recently_used: true,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
+            skills_in_slash_menu: true,
+            skill_completion_by_harness: Default::default(),
             appshots_enabled: false,
             appshot_sound_enabled: true,
             // The destination is only persisted where Appshots exist (macOS and
@@ -2077,6 +2240,7 @@ mod tests {
             code_fences_fit_content: true,
             transcript_width: 960.0,
             open_web_links_in_zeron: false,
+            transcript_compact_mode: true,
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
@@ -3061,6 +3225,32 @@ mod tests {
         assert_eq!(combo_modifiers("mod-alt-shift-k"), (true, true, true));
         assert_eq!(combo_modifiers("f5"), (false, false, false));
         assert_eq!(combo_modifiers("shift-tab"), (false, false, true));
+    }
+
+    #[test]
+    fn a_new_shortcut_default_yields_to_an_existing_custom_binding() {
+        // Upgrade path: a file that predates the files-panel shortcut and had
+        // already put its default chord on another action keeps that binding
+        // and the new row arrives unbound rather than double-bound.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"keymap": {"saveFile": "mod-s", "toggleTerminal": "mod-e"}}"#,
+        )
+        .unwrap();
+        let keymap = UiSettings::load(dir.path()).keymap;
+        assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-e");
+        assert_eq!(keymap.get(ShortcutId::ToggleFiles), "");
+        assert!(conflicted_shortcuts(&keymap).is_empty());
+
+        // With the chord free, the new row takes its default.
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"keymap": {"saveFile": "mod-s", "toggleTerminal": "mod-j"}}"#,
+        )
+        .unwrap();
+        let keymap = UiSettings::load(dir.path()).keymap;
+        assert_eq!(keymap.get(ShortcutId::ToggleFiles), "mod-e");
     }
 
     #[test]

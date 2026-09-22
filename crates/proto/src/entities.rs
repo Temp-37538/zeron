@@ -32,6 +32,20 @@ pub fn validate_sidebar_pin_update(
 pub struct SidebarPreferences {
     #[serde(default)]
     pub pinned_session_ids: Vec<String>,
+    #[serde(default)]
+    pub sections: Vec<SidebarSection>,
+}
+
+/// A user-named sidebar section. Archived sessions retain membership so restoring
+/// them restores their section; deleting the section never deletes sessions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SidebarSection {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 /// Watch payload for pins. `initialized` records known cached state, including
@@ -47,6 +61,8 @@ pub struct SidebarPreferencesState {
     pub initialized: bool,
     #[serde(default)]
     pub pinned_session_ids: Vec<String>,
+    #[serde(default)]
+    pub sections: Vec<SidebarSection>,
 }
 
 impl SidebarPreferencesState {
@@ -209,6 +225,11 @@ pub struct Chat {
     /// dials the room the registry names. Per-chat and instantly revertible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_gen: Option<u32>,
+    /// The chat whose agent created this one (via the Zeron MCP server):
+    /// a parent → child link for orchestration trees. Absent for chats a
+    /// human started; a dangling id (parent deleted) is tolerated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_chat_id: Option<String>,
 }
 
 impl Chat {

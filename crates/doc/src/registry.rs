@@ -36,6 +36,7 @@ pub const KIND_PREFERENCES: &str = "preferences";
 pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
 pub const KIND_SIDEBAR_PINS: &str = "sidebarPins";
 mod sidebar_pins;
+mod sidebar_sections;
 
 /// Snapshot row id in the local `DocsStore` for the persisted registry state.
 pub const REGISTRY_DOC_ID: &str = "registry1";
@@ -913,6 +914,7 @@ impl RegistryDoc {
                 "roomGen",
                 chat.room_gen.map(|g| json!(g)).unwrap_or(Value::Null),
             ),
+            ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
         ]);
         self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
         Ok(())
@@ -1192,6 +1194,7 @@ impl RegistryDoc {
 
     pub fn sidebar_preferences(&self) -> Option<SidebarPreferences> {
         self.sidebar_pins_initialized().then(|| SidebarPreferences {
+            sections: self.sidebar_sections(),
             pinned_session_ids: self
                 .ordered_sidebar_pins()
                 .into_iter()
@@ -1330,6 +1333,7 @@ impl RegistryDoc {
                     ),
                     ("spaceId", opt_str(chat.space_id.as_deref())),
                     ("lastSeenAt", opt_ms(chat.last_seen_at)),
+                    ("parentChatId", opt_str(chat.parent_chat_id.as_deref())),
                 ]),
             );
         }
