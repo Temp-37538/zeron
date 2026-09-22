@@ -389,6 +389,8 @@ impl FakeOpencode {
                 "200 OK",
                 json!({ "data": [{ "name": "init", "description": "Create AGENTS.md" }] }),
             ),
+            // The Agent model option; an empty roster is enough here.
+            ("GET", "/api/agent") => ("200 OK", json!({ "data": [] })),
             ("POST", "/api/session") => ("200 OK", json!({ "data": { "id": "ses_test" } })),
             ("GET", "/api/session/ses_resume") => {
                 ("200 OK", json!({ "data": { "id": "ses_resume" } }))
