@@ -139,6 +139,9 @@ impl TurnWire {
                     let header = String::from_utf8_lossy(&request[..header_end]);
                     let path = header.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_owned();
                     let is_post = header.starts_with("POST ");
+                    // DELETE also carries a body worth recording (the form
+                    // cancel rides it).
+                    let is_write = is_post || header.starts_with("DELETE ");
                     let length = header.lines().find_map(|line| {
                         let (name, value) = line.split_once(':')?;
                         name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
@@ -148,7 +151,7 @@ impl TurnWire {
                         if n == 0 { return; }
                         request.extend_from_slice(&buf[..n]);
                     }
-                    if is_post { recorded.lock().unwrap().push((path.clone(), serde_json::from_slice(&request[header_end..header_end+length]).unwrap_or(Value::Null))); }
+                    if is_write { recorded.lock().unwrap().push((path.clone(), serde_json::from_slice(&request[header_end..header_end+length]).unwrap_or(Value::Null))); }
                     if path == "/global/event" || path == "/api/event" {
                         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: connected\n\n").await.unwrap();
                         let mut events = bus_rx.lock().await.take().unwrap();
@@ -1459,7 +1462,8 @@ async fn permissions_stay_session_scoped_and_never_persist_grants() {
             2,
             "foreign or ownerless permission was answered"
         );
-        let key = if v2 { "decision" } else { "reply" };
+        // `start_proto` speaks 2.0.3, whose reply body is keyed `reply`.
+        let key = "reply";
         for (path, body) in approvals {
             assert_eq!(body[key], "once");
             assert!(!path.contains("foreign") && !path.contains("missing"));
@@ -1824,14 +1828,14 @@ async fn v2_forms_go_through_the_input_bridge_and_reply_by_field_key() {
 }
 
 #[test]
-fn v2_subagent_frames_normalize_to_task_and_carry_late_metadata() {
+fn v2_subagent_frames_keep_the_wire_name_and_carry_late_metadata() {
     let mut tools = HashMap::new();
     let out = normalize_v2_frame(
         json!({"type":"session.tool.input.started","data":{
             "sessionID":"ses_1","assistantMessageID":"msg_a","id":"call_1","name":"subagent"}}),
         &mut tools,
     );
-    assert_eq!(out[0]["properties"]["part"]["tool"], json!("task"));
+    assert_eq!(out[0]["properties"]["part"]["tool"], json!("subagent"));
     let out = normalize_v2_frame(
         json!({"type":"session.tool.progress","data":{
             "sessionID":"ses_1","assistantMessageID":"msg_a","id":"call_1",
@@ -1849,7 +1853,7 @@ fn v2_subagent_frames_normalize_to_task_and_carry_late_metadata() {
             "metadata":{"sessionID":"ses_child","status":"completed","truncated":false}}}),
         &mut tools,
     );
-    assert_eq!(out[0]["properties"]["part"]["tool"], json!("task"));
+    assert_eq!(out[0]["properties"]["part"]["tool"], json!("subagent"));
     assert_eq!(
         out[0]["properties"]["part"]["state"]["status"],
         json!("completed")
@@ -1873,7 +1877,7 @@ fn v2_retry_frames_feed_the_retry_ladder() {
         out,
         vec![json!({"type":"session.status","properties":{
             "sessionID":"ses_1",
-            "status":{"type":"retry","attempt":3,"message":"nope"}}})]
+            "status":{"type":"retry","attempt":3,"next":0,"message":"nope"}}})]
     );
     let out = normalize_v2_frame(
         json!({"type":"session.status","data":{
