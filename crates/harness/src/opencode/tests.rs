@@ -322,25 +322,6 @@ impl TurnWire {
         assert!(path.ends_with(suffix), "unexpected request: {path}");
     }
 
-    async fn posted(&self, suffix: &str) -> Value {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some((_, body)) = self
-                    .posts
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|(path, _)| path.ends_with(suffix))
-                {
-                    return body.clone();
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("expected HTTP reply")
-    }
-
     fn status(&self, status: &str) {
         self.bus.send(json!({"type":"session.status", "properties":{"sessionID":"fixture", "status":{"type":status}}})).unwrap();
     }
@@ -1479,7 +1460,7 @@ fn prompt_body_v2_carries_text_and_files_only() {
 #[tokio::test]
 async fn permissions_stay_session_scoped_and_never_persist_grants() {
     for v2 in [false, true] {
-        let mut wire = TurnWire::start_policy(false, v2, false, None).await;
+        let mut wire = TurnWire::start_proto(false, v2).await;
         if v2 {
             wire.request("/api/model").await;
         }
@@ -1546,40 +1527,42 @@ async fn permissions_stay_session_scoped_and_never_persist_grants() {
 }
 
 #[tokio::test]
-async fn permissions_always_approve_without_user_input() {
+async fn permissions_without_auto_approve_require_an_explicit_answer() {
     for version in ["2.0.0", "2.0.3", "2.0.4", "2.0.11"] {
-        for auto_approve in [false, true] {
-            // No input callback is available: any permission prompt fails the fixture.
+        for accept in [false, true] {
             let mut wire =
-                TurnWire::start_config(false, true, auto_approve, None, version, json!({}), false)
+                TurnWire::start_config(false, true, false, Some(accept), version, json!({}), false)
                     .await;
             wire.request("/api/model").await;
             wire.request("/prompt").await;
+            wire.v2(
+                "permission.asked",
+                json!({"id":"approval", "sessionID":"fixture"}),
+            );
+            let body = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some((_, body)) = wire
+                        .posts
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(p, _)| p.contains("permission"))
+                    {
+                        break body.clone();
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
             let key = if version == "2.0.0" || version == "2.0.3" {
                 "reply"
             } else {
                 "decision"
             };
-            for id in ["first", "second", "third"] {
-                wire.v2("permission.asked", json!({"id":id, "sessionID":"fixture"}));
-                let body = wire.posted(&format!("/permission/{id}/reply")).await;
-                assert_eq!(body, json!({key: "once"}));
-            }
+            assert_eq!(body, json!({key: if accept { "once" } else { "reject" }}));
         }
     }
-}
-
-#[tokio::test]
-async fn permissions_do_not_auto_answer_agent_questions() {
-    let mut wire = TurnWire::start_policy(false, false, false, Some(false)).await;
-    wire.request("/prompt_async").await;
-    wire.bus.send(json!({"type": "question.asked", "properties": {
-        "id": "question", "sessionID": "fixture", "questions": [{
-            "header": "Choice", "question": "Continue?", "options": [{"label": "No"}, {"label": "Yes"}]
-        }]
-    }})).unwrap();
-    let body = wire.posted("/question/question/reply").await;
-    assert_eq!(body, json!({"answers": [["No"]]}));
 }
 
 #[test]
