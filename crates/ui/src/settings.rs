@@ -25,6 +25,7 @@ pub mod files;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
+pub mod thread_naming;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -634,11 +635,12 @@ pub struct SkillCompletionSettings {
 }
 
 impl SkillCompletionSettings {
-    pub fn for_harness(harness: zeron_proto::HarnessId) -> Self {
-        let native_dollar = harness == zeron_proto::HarnessId::Codex;
+    /// Every harness defaults to `$` skills kept out of the `/` menu; an
+    /// explicit per-harness choice (or the legacy slash-menu flag) wins.
+    pub fn for_harness(_harness: zeron_proto::HarnessId) -> Self {
         Self {
-            dollar: native_dollar,
-            separate_from_slash: native_dollar,
+            dollar: true,
+            separate_from_slash: true,
         }
     }
 }
@@ -754,6 +756,10 @@ pub struct UiSettings {
     /// Whether Ctrl+Tab toggles with the session left last instead of stepping
     /// through the sidebar in drawn order. Device-local and opt-in.
     pub cycle_sessions_recently_used: bool,
+    /// The Settings section last viewed. ⌘, / Ctrl+,, the footer gear and the
+    /// palette reopen it; links naming a section replace it. Files without
+    /// it, or with a name this build does not know, open on General.
+    pub settings_section: crate::shell::SettingsSection,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
     /// Optional columns shown in every Git History pane.
@@ -854,6 +860,7 @@ impl Default for UiSettings {
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
             cycle_sessions_recently_used: false,
+            settings_section: crate::shell::SettingsSection::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
             skills_in_slash_menu: false,
             skill_completion_by_harness: Default::default(),
@@ -1626,13 +1633,13 @@ mod tests {
         let mut settings = UiSettings::default();
         for (harness, _) in SKILL_COMPLETION_HARNESSES {
             let preferences = settings.skill_completion(harness);
-            assert_eq!(preferences.dollar, harness == HarnessId::Codex);
-            assert_eq!(preferences.separate_from_slash, harness == HarnessId::Codex);
+            assert!(preferences.dollar);
+            assert!(preferences.separate_from_slash);
         }
         settings.skill_completion_by_harness.insert(
             HarnessId::ClaudeCode,
             SkillCompletionSettings {
-                dollar: true,
+                dollar: false,
                 separate_from_slash: true,
             },
         );
@@ -1649,8 +1656,8 @@ mod tests {
             settings.skill_completion_by_harness,
             loaded.skill_completion_by_harness
         );
-        assert!(loaded.skill_completion(HarnessId::ClaudeCode).dollar);
-        assert!(!loaded.skill_completion(HarnessId::Cursor).dollar);
+        assert!(!loaded.skill_completion(HarnessId::ClaudeCode).dollar);
+        assert!(loaded.skill_completion(HarnessId::Cursor).dollar);
         let legacy: UiSettings = serde_json::from_str(r#"{"skillsInSlashMenu":true}"#).unwrap();
         assert!(
             !legacy
@@ -1745,6 +1752,59 @@ mod tests {
         let saved: WindowGeometry = serde_json::from_str(&encoded).unwrap();
         assert_eq!(saved.restore(&[primary, secondary], 0), Some((1, saved)));
         assert_eq!(saved.restore(&[secondary, primary], 1), Some((0, saved)));
+    }
+
+    #[test]
+    fn settings_section_round_trips_and_old_or_unknown_values_read_as_general() {
+        use crate::shell::SettingsSection;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = UiSettings {
+            settings_section: SettingsSection::Appearance,
+            ..Default::default()
+        };
+        settings.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        assert!(
+            text.contains(r#""settingsSection": "appearance""#),
+            "{text}"
+        );
+        assert_eq!(
+            UiSettings::load(dir.path()).settings_section,
+            SettingsSection::Appearance
+        );
+        for section in SettingsSection::ALL {
+            let encoded = serde_json::to_string(&UiSettings {
+                settings_section: section,
+                ..Default::default()
+            })
+            .unwrap();
+            let decoded: UiSettings = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.settings_section, section);
+        }
+
+        // A file written before the field existed.
+        let legacy: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
+        assert_eq!(legacy.settings_section, SettingsSection::General);
+        assert_eq!(legacy.sidebar_width, 300.0);
+        // Unknown names and malformed values read as General without
+        // defaulting the rest of the file.
+        for raw in [r#""billing""#, "42", "null", r#"{"section":"devices"}"#] {
+            std::fs::write(
+                UiSettings::path(dir.path()),
+                format!(r#"{{"sidebarWidth": 300, "settingsSection": {raw}}}"#),
+            )
+            .unwrap();
+            let loaded = UiSettings::load(dir.path());
+            assert_eq!(loaded.settings_section, SettingsSection::General, "{raw}");
+            assert_eq!(loaded.sidebar_width, 300.0, "{raw}");
+        }
+        // The legacy Accounts alias still reads, and reopens as Providers.
+        let alias: UiSettings = serde_json::from_str(r#"{"settingsSection":"agents"}"#).unwrap();
+        assert_eq!(alias.settings_section, SettingsSection::Agents);
+        assert_eq!(
+            alias.settings_section.reopenable(),
+            SettingsSection::Harnesses
+        );
     }
 
     #[test]
@@ -2199,6 +2259,7 @@ mod tests {
             },
             escape_stops_active_agent: true,
             cycle_sessions_recently_used: true,
+            settings_section: crate::shell::SettingsSection::Shortcuts,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             skills_in_slash_menu: true,
             skill_completion_by_harness: Default::default(),
